@@ -1,0 +1,51 @@
+# 依赖与构建产物
+node_modules
+dist
+out
+*.tgz
+
+# 缓存
+.eslintcache
+.electron-builder-cache
+.electron-cache
+*.tsbuildinfo
+
+# 日志与临时文件
+*.log*
+.tmp-*.png
+*.tmp
+*.har
+
+# 环境变量与密钥(切勿上传)
+.env
+.env.*
+*.local
+
+# 编辑器/IDE 配置
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Claude Code 本地工作目录
+.claude/
+
+# Git 隔离工作区
+.worktrees/
+
+# Trae 工作目录
+.trae/
+
+# OS 系统文件
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 设计预览与开发计划
+/design-previews/
+docs/superpowers/

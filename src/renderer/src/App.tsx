@@ -1,0 +1,5054 @@
+import { useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties } from 'react'
+import {
+  DEFAULT_IQ_THRESHOLD,
+  DEFAULT_SETTINGS,
+  DEFAULT_WINDOW_PREFERENCES,
+  CAPSULE_MINIMAL_TRIGGER_MS,
+  CAPSULE_MINIMAL_WINDOW_SIZE,
+  DUAL_CAPSULE_WINDOW_WIDTH,
+  MAX_IQ_THRESHOLD,
+  MIN_IQ_THRESHOLD,
+  REFRESH_INTERVAL_OPTIONS,
+  MAX_REFRESH_INTERVAL_SECONDS,
+  MIN_REFRESH_INTERVAL_SECONDS,
+  createEmptySnapshot,
+  type AnnouncementState,
+  type AppSettings,
+  type AgentId,
+  type AuthMode,
+  type BroadcastMessage,
+  type LocaleCode,
+  type ModelUsage,
+  type PanelFocusTarget,
+  type PanelView,
+  type PercentageMode,
+  type RateLimitWindowSnapshot,
+  type ReactionMessage,
+  type RendererWindowRole,
+  type SpendUsage,
+  type ThemeId,
+  type TokenUsageDay,
+  type TokenUsageHour,
+  type TokenUsageMinute,
+  type TokenUsageOverview,
+  type UsageSnapshot,
+  type UsageWindow,
+  type WindowKeeperState,
+  type WindowKeeperStatus,
+  type WindowPreferences
+} from '../../shared/capsule'
+import { formatAnnouncementTime, resolveCapsuleAlert } from '../../shared/announcement'
+import { createEmptyIslandSnapshot, type IslandSnapshot } from '../../shared/island'
+import { IslandSettingsCard } from './island/IslandSettingsCard'
+
+const DEFAULT_CUSTOM_REFRESH_INTERVAL_SECONDS = 40
+const CAPSULE_CLICK_DRAG_DISTANCE = 5
+const MANUAL_REFRESH_FEEDBACK_MS = 680
+const PANEL_TAB_MOTION_CLEAR_MS = 800
+const TEAM_BOARD_MOTION_CLEAR_MS = 1360
+const TEAM_ROW_STAGGER_MS = 72
+const TEAM_ROW_STAGGER_MAX_INDEX = 5
+// 广播消息:胶囊进入消息态后无操作 N 毫秒自动回额度;panel 会话内消息流上限
+const BROADCAST_REVERT_MS = 15000
+const BROADCAST_FEED_LIMIT = 3
+// 跑马灯时长随文本长度线性,夹在 6s~20s 之间
+const CAPSULE_MARQUEE_MIN_MS = 6000
+const CAPSULE_MARQUEE_MAX_MS = 20000
+const CAPSULE_MARQUEE_PER_CHAR_MS = 80
+// 点赞特效:播放时长(覆盖胶囊后淡出恢复),连赞会重新播放并刷新计时
+const HEART_EFFECT_DURATION_MS = 2400
+// 特效库:每次收到点赞随机选一种,连续两次不会重复
+const HEART_EFFECT_KINDS = [
+  'rain',
+  'bloom',
+  'orbit',
+  'wave',
+  'shooting',
+  'heartbeat',
+  'firework',
+  'hug',
+  'ribbon',
+  'gift',
+  'cupid',
+  'balloon',
+  'superlike'
+] as const
+const CAPSULE_MINIMAL_COLLAPSE_MS = 200
+const CAPSULE_MINIMAL_LEAVE_MS = 120
+const CAPSULE_MINIMAL_REVEAL_MS = 240
+type CapsuleMinimalStage = 'full' | 'collapsing' | 'minimal' | 'expanding'
+type HeartEffectKind = (typeof HEART_EFFECT_KINDS)[number]
+// 点赞过期按本地自然日(与 token 榜 1d 窗口同为自然日),跨天即清零,避免滚动24h与榜单错位
+
+// 外观主题:顺序与 THEME_IDS 一致,标签供设置页 SegmentedControl 展示
+const THEME_OPTIONS: ReadonlyArray<{ label: string; value: ThemeId }> = [
+  { label: '星夜', value: 'midnight' },
+  { label: '极光', value: 'aurora' },
+  { label: '赛博', value: 'cyber' },
+  { label: '钛金', value: 'titan' },
+  { label: '海报', value: 'poster' },
+  { label: '孟菲斯', value: 'memphis' },
+  { label: '座舱', value: 'cockpit' },
+  { label: '宋韵', value: 'inksong' },
+  { label: '温室', value: 'greenhouse' },
+  { label: '社论', value: 'swiss' }
+]
+
+interface CapsulePointerState {
+  pointerId: number
+  originScreenX: number
+  originScreenY: number
+  offsetX: number
+  offsetY: number
+  hasDragged: boolean
+}
+
+const COPY = {
+  'zh-CN': {
+    noData: '无数据',
+    refresh: '刷新',
+    refreshing: '刷新中',
+    source: '来源',
+    lastRefresh: '最近刷新',
+    settings: '设置',
+    details: '详情',
+    close: '收起',
+    done: '完成',
+    back: '返回详情',
+    reset: '重置',
+    refreshMode: '刷新模式',
+    refreshInterval: '刷新间隔',
+    customInterval: '自定义秒数',
+    custom: '自定义',
+    percentageMode: '百分比口径',
+    language: '语种',
+    launchAtLogin: '开机自启动',
+    groupRefresh: '刷新',
+    groupDisplay: '显示',
+    groupGeneral: '通用',
+    groupRecommend: '推荐策略',
+    groupRegion: '语言与区域',
+    auto: '自动',
+    manual: '手动',
+    enabled: '开启',
+    disabled: '关闭',
+    remaining: '剩余',
+    used: '已使用',
+    officialSource: '官方接口',
+    localSource: '本地 JSONL',
+    emptySource: '无数据',
+    officialUnavailable: '官方接口不可用',
+    lastRefreshHint: '最近刷新',
+    resetExpiry: '到期时间',
+    resetCredit: '重置卡',
+    today: '今天',
+    yesterday: '昨天',
+    iqThreshold: '推荐模型 IQ 阈值',
+    iqThresholdHint: '低于此分数的模型不进入推荐',
+    team: '团队',
+    teamBoard: '额度排行榜',
+    teamBoardHint: '同组成员按剩余额度降序排名',
+    teamModeQuota: '额度',
+    teamModeTokens: 'Token消耗',
+    teamTokenBoard: 'Token 消耗排行榜',
+    teamEmpty: '暂无在线同事,加入团队后会显示同组成员',
+    teamSummaryOnline: '在线',
+    teamSummaryOnlineUnit: '人',
+    teamSummaryAvg: '平均剩余',
+    teamSummaryCredits: '重置卡共',
+    teamSummaryCreditsUnit: '张',
+    teamNickname: '团队昵称',
+    teamNicknameHint: '仅作展示,不涉及凭据',
+    teamGroup: '团队口令',
+    teamGroupHint: '同口令的成员才互见',
+    teamAnonymous: '未命名成员',
+    broadcastEmpty: '暂无消息,发一条让同组同事看到吧',
+    broadcastPlaceholder: '发送一条消息,同组成员可见…',
+    broadcastSend: '发送',
+    broadcastNotInTeam: '未加入团队,设置口令后才能广播',
+    broadcastRateLimited: '发送过快,请 2 秒后再试',
+    broadcastInvalid: '消息为空或超过 200 字',
+    capsuleMessageAria: '广播消息,点击查看消息',
+    announcement: '公告',
+    announcementAcknowledge: '已知',
+    announcementUnread: '未读公告',
+    author: '作者',
+    version: '版本',
+    groupAbout: '关于',
+    currentVersion: '当前版本',
+    checkUpdate: '检查更新',
+    checking: '检查中…',
+    upToDate: '已是最新版本',
+    newVersionAvailable: '发现新版本',
+    downloading: '下载中',
+    downloaded: '下载完成',
+    installNow: '安装并重启',
+    updateError: '更新失败',
+    retryUpdate: '重试',
+    downloadNow: '立即下载',
+    usage: '用量统计',
+    usageTotal: '总 Token',
+    usageInput: '输入',
+    usageOutput: '输出',
+    usageCost: '花费',
+    usageCached: '缓存',
+    usageReasoning: '思考',
+    usageCacheHit: '缓存命中',
+    usageToday: '今日消耗',
+    usageEmpty: '暂无用量数据',
+    apiModeSource: 'API Key · 按量计费',
+    apiBadge: 'API Key',
+    spendReal: '真实账单',
+    usage1d: '1天',
+    usage7d: '7天',
+    usage30d: '30天',
+    usageHourlyToday: '今日小时分布',
+    usageMinuteRange: '分钟分布',
+    usageMinuteHourHint: '点击柱状图下钻到分钟',
+    modelUsage: '模型用量',
+    modelOther: '其他',
+    rangeCustom: '自定义',
+    rangeStart: '开始',
+    rangeEnd: '结束',
+    rangeApply: '应用',
+    usageEstimated: '本地估算',
+    groupAgent: '工具',
+    agentId: '监控工具',
+    agentIdHint: '选择要统计用量与花费的 Agent 工具',
+    groupAppearance: '外观',
+    theme: '主题',
+    themeHint: '切换胶囊与面板的整体风格',
+    minimalMode: '极简模式',
+    autoKeep5hWindow: '自动保持 5h 窗口',
+    windowKeeper: '自动保持 5h 窗口',
+    windowKeeperState: '运行状态',
+    windowKeeperNextAction: '下次动作时间',
+    windowKeeperLastTriggered: '上次成功触发时间',
+    windowKeeperRecentError: '最近错误',
+    windowKeeperDisabled: '已关闭',
+    windowKeeperWaitingData: '等待额度数据',
+    windowKeeperWaitingWeeklyReset: '等待周额度恢复',
+    windowKeeperWaitingReset: '等待 5h 重置',
+    windowKeeperWaitingWindow: '等待 5h 窗口',
+    windowKeeperTriggering: '正在触发',
+    windowKeeperVerifying: '正在验证额度',
+    windowKeeperRetrying: '重试中',
+    windowKeeperError: '异常'
+  },
+  'en-US': {
+    noData: 'No data',
+    refresh: 'Refresh',
+    refreshing: 'Refreshing',
+    source: 'Source',
+    lastRefresh: 'Last refresh',
+    settings: 'Settings',
+    details: 'Details',
+    close: 'Close',
+    done: 'Done',
+    back: 'Back to details',
+    reset: 'reset',
+    refreshMode: 'Refresh mode',
+    refreshInterval: 'Refresh interval',
+    customInterval: 'Custom seconds',
+    custom: 'Custom',
+    percentageMode: 'Metric mode',
+    language: 'Language',
+    launchAtLogin: 'Open at login',
+    groupRefresh: 'Refresh',
+    groupDisplay: 'Display',
+    groupGeneral: 'General',
+    groupRecommend: 'Recommendation',
+    groupRegion: 'Language & region',
+    auto: 'Auto',
+    manual: 'Manual',
+    enabled: 'Enabled',
+    disabled: 'Disabled',
+    remaining: 'Remaining',
+    used: 'Used',
+    officialSource: 'Official API',
+    localSource: 'Local JSONL',
+    emptySource: 'No data',
+    officialUnavailable: 'Official API unavailable',
+    lastRefreshHint: 'Last refresh',
+    resetExpiry: 'Expires at',
+    resetCredit: 'Reset card',
+    today: 'Today',
+    yesterday: 'Yesterday',
+    iqThreshold: 'Model IQ threshold',
+    iqThresholdHint: 'Models below this score are excluded from picks',
+    team: 'Team',
+    teamBoard: 'Quota leaderboard',
+    teamBoardHint: 'Sorted by remaining quota, descending',
+    teamModeQuota: 'Quota',
+    teamModeTokens: 'Tokens',
+    teamTokenBoard: 'Token usage',
+    teamEmpty: 'No peers online. Join a team to see members.',
+    teamSummaryOnline: 'Online',
+    teamSummaryOnlineUnit: '',
+    teamSummaryAvg: 'Avg remaining',
+    teamSummaryCredits: 'Reset cards',
+    teamSummaryCreditsUnit: '',
+    teamNickname: 'Team nickname',
+    teamNicknameHint: 'Display only, no credentials shared',
+    teamGroup: 'Team passphrase',
+    teamGroupHint: 'Only peers with the same passphrase can see each other',
+    teamAnonymous: 'Unnamed member',
+    broadcastEmpty: 'No messages yet — send one to your team',
+    broadcastPlaceholder: 'Send a message visible to your team…',
+    broadcastSend: 'Send',
+    broadcastNotInTeam: 'Not in a team — set a passphrase to broadcast',
+    broadcastRateLimited: 'Sending too fast — wait 2s and retry',
+    broadcastInvalid: 'Message is empty or exceeds 200 characters',
+    capsuleMessageAria: 'Broadcast message, click to view',
+    announcement: 'Announcement',
+    announcementAcknowledge: 'Got it',
+    announcementUnread: 'Unread announcement',
+    author: 'Author',
+    version: 'Version',
+    groupAbout: 'About',
+    currentVersion: 'Current version',
+    checkUpdate: 'Check for updates',
+    checking: 'Checking…',
+    upToDate: 'Up to date',
+    newVersionAvailable: 'New version available',
+    downloading: 'Downloading',
+    downloaded: 'Downloaded',
+    installNow: 'Install & restart',
+    updateError: 'Update failed',
+    retryUpdate: 'Retry',
+    downloadNow: 'Download',
+    usage: 'Usage stats',
+    usageTotal: 'Tokens',
+    usageInput: 'Input',
+    usageOutput: 'Output',
+    usageCost: 'Cost',
+    usageCached: 'Cached',
+    usageReasoning: 'Reasoning',
+    usageCacheHit: 'Cache hit',
+    usageToday: 'Today used',
+    usageEmpty: 'No usage data yet',
+    apiModeSource: 'API Key · usage-based',
+    apiBadge: 'API Key',
+    spendReal: 'Real billing',
+    usage1d: '1d',
+    usage7d: '7d',
+    usage30d: '30d',
+    usageHourlyToday: 'Today (hourly)',
+    usageMinuteRange: 'Minute breakdown',
+    usageMinuteHourHint: 'Click a bar to drill into minutes',
+    modelUsage: 'Model usage',
+    modelOther: 'Other',
+    rangeCustom: 'Custom',
+    rangeStart: 'Start',
+    rangeEnd: 'End',
+    rangeApply: 'Apply',
+    usageEstimated: 'Estimated',
+    groupAgent: 'Agent',
+    agentId: 'Agent tool',
+    agentIdHint: 'Choose which agent tool to monitor',
+    groupAppearance: 'Appearance',
+    theme: 'Theme',
+    themeHint: 'Switch the overall capsule and panel style',
+    minimalMode: 'Minimal mode',
+    autoKeep5hWindow: 'Keep 5h window active',
+    windowKeeper: 'Keep 5h Window Active',
+    windowKeeperState: 'State',
+    windowKeeperNextAction: 'Next action',
+    windowKeeperLastTriggered: 'Last successful trigger',
+    windowKeeperRecentError: 'Recent error',
+    windowKeeperDisabled: 'Disabled',
+    windowKeeperWaitingData: 'Waiting for quota data',
+    windowKeeperWaitingWeeklyReset: 'Waiting for weekly quota reset',
+    windowKeeperWaitingReset: 'Waiting for 5h reset',
+    windowKeeperWaitingWindow: 'Waiting for 5h window',
+    windowKeeperTriggering: 'Triggering',
+    windowKeeperVerifying: 'Verifying quota',
+    windowKeeperRetrying: 'Retrying',
+    windowKeeperError: 'Error'
+  }
+} as const
+
+function App(): React.JSX.Element {
+  const [snapshot, setSnapshot] = useState<UsageSnapshot>(() => createEmptySnapshot())
+  // API Key 模式胶囊:今日 token 用量(取 1d 窗口,算缓存命中率与今日用量)
+  const [capsuleToday, setCapsuleToday] = useState<TokenUsageOverview | undefined>(undefined)
+  const [settings, setSettings] = useState<AppSettings>({ ...DEFAULT_SETTINGS })
+  const [islandSnapshot, setIslandSnapshot] = useState<IslandSnapshot>(createEmptyIslandSnapshot)
+  const [windowPreferences, setWindowPreferences] = useState<WindowPreferences>({
+    ...DEFAULT_WINDOW_PREFERENCES
+  })
+  const [windowRole, setWindowRole] = useState<RendererWindowRole>('capsule')
+  const [panelView, setPanelView] = useState<PanelView>('details')
+  const [panelRevealRequest, setPanelRevealRequest] = useState(0)
+  const [tabMotionView, setTabMotionView] = useState<PanelView | null>(null)
+  const [customRefreshInput, setCustomRefreshInput] = useState(
+    String(DEFAULT_SETTINGS.refreshIntervalSeconds)
+  )
+  const [iqThresholdInput, setIqThresholdInput] = useState(
+    String(DEFAULT_SETTINGS.iqThreshold ?? DEFAULT_IQ_THRESHOLD)
+  )
+  const [teamNicknameInput, setTeamNicknameInput] = useState(DEFAULT_SETTINGS.teamNickname ?? '')
+  const [teamGroupInput, setTeamGroupInput] = useState(DEFAULT_SETTINGS.teamGroup ?? '')
+  // 团队页排行榜模式:quota=额度, tokens=Token 消耗;消耗模式再选 1d/7d/30d 窗口
+  const [teamBoardMode, setTeamBoardMode] = useState<'quota' | 'tokens'>('quota')
+  const [teamTokenWindow, setTeamTokenWindow] = useState<UsageWindow>('1d')
+  const [teamBoardMotionActive, setTeamBoardMotionActive] = useState(false)
+  const [capsulePointerActive, setCapsulePointerActive] = useState(false)
+  const [minimalStage, setMinimalStage] = useState<CapsuleMinimalStage>('full')
+  const [pointerInsideCapsule, setPointerInsideCapsule] = useState(false)
+  const [minimalReveal, setMinimalReveal] = useState(false)
+  const [minimalBallSize, setMinimalBallSize] = useState<number>(CAPSULE_MINIMAL_WINDOW_SIZE.width)
+  const [manualRefreshActive, setManualRefreshActive] = useState(false)
+  const [appVersion, setAppVersion] = useState('')
+  // 在线更新状态机:idle/checking/upToDate/available/downloading/downloaded/error
+  // upToDate:检查完无更新(或 dev 环境),提示几秒后回 idle
+  const [updateState, setUpdateState] = useState<
+    'idle' | 'checking' | 'upToDate' | 'available' | 'downloading' | 'downloaded' | 'error'
+  >('idle')
+  const [updateVersion, setUpdateVersion] = useState('')
+  const [updateProgress, setUpdateProgress] = useState(0)
+  const [updateError, setUpdateError] = useState('')
+  // 刷新完成后短暂触发百分比"弹跳"反馈,让用户感知新数据到达
+  const [justRefreshed, setJustRefreshed] = useState(false)
+  const [ready, setReady] = useState(false)
+  // 胶囊版本角标跳转:打开设置页后需定位到检查更新区(一次性,滚动后清除)
+  const [focusUpdatePending, setFocusUpdatePending] = useState(false)
+  const [focusTargetPending, setFocusTargetPending] = useState<PanelFocusTarget | null>(null)
+  const aboutRowRef = useRef<HTMLDivElement | null>(null)
+  // 详情面板里长窗口(周重置)倒计时需要秒级刷新;只在面板可见且有长窗口时 tick
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  const capsulePointerRef = useRef<CapsulePointerState | null>(null)
+  const minimalStageRef = useRef<CapsuleMinimalStage>('full')
+  const minimalStageTimerRef = useRef<number | undefined>(undefined)
+  const minimalRevealTimerRef = useRef<number | undefined>(undefined)
+  const capsuleRef = useRef<HTMLElement | null>(null)
+  const manualRefreshTimerRef = useRef<number | undefined>(undefined)
+  const justRefreshedTimerRef = useRef<number | undefined>(undefined)
+  const tabMotionTimerRef = useRef<number | undefined>(undefined)
+  const teamBoardMotionTimerRef = useRef<number | undefined>(undefined)
+  // "已是最新"提示停留几秒后自动回 idle
+  const upToDateTimerRef = useRef<number | undefined>(undefined)
+  // 局域网广播消息:panel 会话内消息流 + 胶囊当前展示消息(到达即切,无操作自动回)
+  const [broadcastMessages, setBroadcastMessages] = useState<BroadcastMessage[]>([])
+  const [capsuleMessage, setCapsuleMessage] = useState<BroadcastMessage | null>(null)
+  const capsuleMessageTimerRef = useRef<number | undefined>(undefined)
+  // 消息文本是否溢出胶囊:放得下就静态显示全文,溢出才启用跑马灯(方案C)
+  const [capsuleMessageOverflow, setCapsuleMessageOverflow] = useState(false)
+  const capsuleMessageTextRef = useRef<HTMLSpanElement | null>(null)
+  // self peerId 在 bootstrap 后才知道,订阅回调里用 ref 读取避免闭包过期
+  const selfPeerIdRef = useRef<string | undefined>(undefined)
+  // 广播发送:输入、发送中、失败提示(区分未加入团队/发送过快)
+  const [broadcastInput, setBroadcastInput] = useState('')
+  const [broadcastSending, setBroadcastSending] = useState(false)
+  const [broadcastSendError, setBroadcastSendError] = useState('')
+  // 排行榜点赞事件:会话内收集,按目标成员聚合;超 24h 自动过期
+  const [reactions, setReactions] = useState<ReactionMessage[]>([])
+  // 点赞特效:收到赞后随机播放一种,id 变化强制重播,结束后置空恢复胶囊原样
+  const [heartEffect, setHeartEffect] = useState<{ kind: HeartEffectKind; id: number } | null>(null)
+  const heartEffectIdRef = useRef(0)
+  const heartEffectTimerRef = useRef<number | undefined>(undefined)
+  const lastHeartEffectKindRef = useRef<HeartEffectKind | undefined>(undefined)
+  // 消息流容器:新消息到达时滚到底,保证最新可见
+  const broadcastFeedRef = useRef<HTMLDivElement | null>(null)
+  const announcementRef = useRef<HTMLElement | null>(null)
+  // 三个视图共用同一个 .panel__content 滚动节点(React 按位置复用,不卸载),切换 tab 需手动重置滚动
+  const panelContentRef = useRef<HTMLDivElement | null>(null)
+  const announcementVisibleRef = useRef(false)
+  const [announcement, setAnnouncement] = useState<AnnouncementState | null>(null)
+
+  // 每次切换 tab 滚动回顶部
+  useLayoutEffect(() => {
+    panelContentRef.current?.scrollTo(0, 0)
+  }, [panelView])
+
+  useEffect(() => {
+    let active = true
+
+    void window.chatgptUsage
+      .bootstrap()
+      .then((payload) => {
+        if (!active) {
+          return
+        }
+
+        setSnapshot(payload.snapshot)
+        setSettings(payload.settings)
+        setIslandSnapshot(payload.island)
+        setWindowPreferences(payload.window)
+        setWindowRole(payload.role)
+        setPanelView(payload.panelView)
+        setAnnouncement(payload.announcement)
+        if (payload.focusUpdate) {
+          setFocusUpdatePending(true)
+        }
+        if (payload.focusTarget) {
+          setFocusTargetPending(payload.focusTarget)
+        }
+        setCustomRefreshInput(String(payload.settings.refreshIntervalSeconds))
+        setIqThresholdInput(String(payload.settings.iqThreshold))
+        setTeamNicknameInput(payload.settings.teamNickname ?? '')
+        setTeamGroupInput(payload.settings.teamGroup ?? '')
+        setAppVersion(payload.version)
+        setReady(true)
+      })
+      .catch((error) => {
+        if (!active) {
+          return
+        }
+
+        setSnapshot({
+          ...createEmptySnapshot(),
+          issues: [error instanceof Error ? error.message : String(error)]
+        })
+        setReady(true)
+      })
+
+    const disposeSnapshot = window.chatgptUsage.onSnapshotUpdated((nextSnapshot) => {
+      setSnapshot(nextSnapshot)
+    })
+
+    const disposePreferences = window.chatgptUsage.onPreferencesUpdated((payload) => {
+      setSettings(payload.settings)
+      setWindowPreferences(payload.window)
+      setCustomRefreshInput(String(payload.settings.refreshIntervalSeconds))
+      setIqThresholdInput(String(payload.settings.iqThreshold))
+      setTeamNicknameInput(payload.settings.teamNickname ?? '')
+      setTeamGroupInput(payload.settings.teamGroup ?? '')
+    })
+
+    const disposeIsland = window.chatgptUsage.onIslandUpdated(setIslandSnapshot)
+
+    const disposeCommand = window.chatgptUsage.onCommand((payload) => {
+      if (payload.type !== 'show-panel-view') {
+        return
+      }
+
+      if (payload.panelView !== 'team') {
+        announcementVisibleRef.current = false
+        if (teamBoardMotionTimerRef.current !== undefined) {
+          window.clearTimeout(teamBoardMotionTimerRef.current)
+          teamBoardMotionTimerRef.current = undefined
+        }
+        setTeamBoardMotionActive(false)
+      }
+      if (tabMotionTimerRef.current !== undefined) {
+        window.clearTimeout(tabMotionTimerRef.current)
+        tabMotionTimerRef.current = undefined
+      }
+      setTabMotionView(null)
+      setPanelView(payload.panelView)
+      if (payload.focusUpdate) {
+        setFocusUpdatePending(true)
+      }
+      if (payload.focusTarget) {
+        setFocusTargetPending(payload.focusTarget)
+      }
+      setPanelRevealRequest((value) => value + 1)
+    })
+
+    // 订阅更新进度:主进程转发 autoUpdater 事件,据此驱动 UI 状态机
+    const disposeUpdateProgress = window.chatgptUsage.onUpdateProgress((payload) => {
+      switch (payload.stage) {
+        case 'checking':
+          setUpdateState('checking')
+          break
+        case 'available':
+          setUpdateState('available')
+          setUpdateVersion(payload.version ?? '')
+          break
+        case 'not-available':
+          // 无更新:进 upToDate 态停留几秒回 idle,给用户明确反馈而非静默
+          setUpdateError('')
+          setUpdateState('upToDate')
+          if (upToDateTimerRef.current !== undefined) {
+            window.clearTimeout(upToDateTimerRef.current)
+          }
+          upToDateTimerRef.current = window.setTimeout(() => {
+            setUpdateState('idle')
+            upToDateTimerRef.current = undefined
+          }, 3000)
+          break
+        case 'downloading':
+          setUpdateState('downloading')
+          setUpdateProgress(Math.round(payload.percent ?? 0))
+          break
+        case 'downloaded':
+          setUpdateState('downloaded')
+          break
+        case 'error':
+          setUpdateState('error')
+          setUpdateError(payload.message ?? 'error')
+          break
+      }
+    })
+
+    // 订阅局域网广播消息:进会话流;非自己发的再驱动胶囊消息态(到达即切,重置回退定时器)
+    const disposeBroadcast = window.chatgptUsage.onBroadcastMessage((message) => {
+      setBroadcastMessages((previous) => [...previous, message].slice(-BROADCAST_FEED_LIMIT))
+      if (message.senderPeerId === selfPeerIdRef.current) {
+        return
+      }
+      setCapsuleMessage(message)
+      if (capsuleMessageTimerRef.current !== undefined) {
+        window.clearTimeout(capsuleMessageTimerRef.current)
+      }
+      if (minimalStageTimerRef.current !== undefined) {
+        window.clearTimeout(minimalStageTimerRef.current)
+      }
+      if (minimalRevealTimerRef.current !== undefined) {
+        window.clearTimeout(minimalRevealTimerRef.current)
+      }
+      capsuleMessageTimerRef.current = window.setTimeout(() => {
+        setCapsuleMessage(null)
+        capsuleMessageTimerRef.current = undefined
+      }, BROADCAST_REVERT_MS)
+    })
+
+    const disposeAnnouncement = window.chatgptUsage.onAnnouncementUpdated((state) => {
+      setAnnouncement(state)
+    })
+
+    // 订阅点赞事件:追加并裁剪非今日事件,聚合在渲染时按目标成员计算
+    const disposeReaction = window.chatgptUsage.onReaction((reaction) => {
+      setReactions((previous) => {
+        const todayKey = localDayKey(Date.now())
+        const pruned = previous.filter((r) => localDayKey(r.sentAt) === todayKey)
+        return [...pruned, reaction]
+      })
+      // 别人给我点赞:胶囊整体播放爱心特效数秒,提供被赞的情绪价值
+      if (reaction.action === 'add' && reaction.targetPeerId === selfPeerIdRef.current) {
+        if (minimalStageRef.current === 'full') spawnHeartEffect()
+      }
+    })
+
+    return () => {
+      active = false
+      if (manualRefreshTimerRef.current !== undefined) {
+        window.clearTimeout(manualRefreshTimerRef.current)
+      }
+      if (justRefreshedTimerRef.current !== undefined) {
+        window.clearTimeout(justRefreshedTimerRef.current)
+      }
+      if (tabMotionTimerRef.current !== undefined) {
+        window.clearTimeout(tabMotionTimerRef.current)
+      }
+      if (teamBoardMotionTimerRef.current !== undefined) {
+        window.clearTimeout(teamBoardMotionTimerRef.current)
+      }
+      if (upToDateTimerRef.current !== undefined) {
+        window.clearTimeout(upToDateTimerRef.current)
+      }
+      if (heartEffectTimerRef.current !== undefined) {
+        window.clearTimeout(heartEffectTimerRef.current)
+      }
+      if (capsuleMessageTimerRef.current !== undefined) {
+        window.clearTimeout(capsuleMessageTimerRef.current)
+      }
+      disposeSnapshot()
+      disposePreferences()
+      disposeIsland()
+      disposeCommand()
+      disposeUpdateProgress()
+      disposeBroadcast()
+      disposeAnnouncement()
+      disposeReaction()
+    }
+  }, [])
+
+  useEffect(() => {
+    minimalStageRef.current = minimalStage
+  }, [minimalStage])
+
+  useLayoutEffect(() => {
+    if (windowRole !== 'capsule' || !capsuleRef.current) return
+    const raw = window
+      .getComputedStyle(capsuleRef.current)
+      .getPropertyValue('--capsule-minimal-size')
+    const size = Number.parseFloat(raw)
+    if (Number.isFinite(size) && size >= 24 && size <= 64) {
+      setMinimalBallSize(Math.round(size))
+    }
+  }, [windowRole, settings.theme])
+
+  // API Key 模式胶囊:随快照刷新(每 30s)拉取今日 token,驱动缓存命中率进度条与今日用量
+  useEffect(() => {
+    if (windowRole !== 'capsule' || snapshot.authMode !== 'api') {
+      return
+    }
+    let cancelled = false
+    window.chatgptUsage
+      .getTokenUsage('1d')
+      .then((result) => {
+        if (!cancelled) {
+          setCapsuleToday(result)
+        }
+      })
+      .catch(() => {
+        // 拉取失败:胶囊回退显示 '--'
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [windowRole, snapshot.authMode, snapshot.generatedAt])
+
+  const copy = COPY[settings.locale]
+  const canRefresh = snapshot.canRefresh !== false
+  const fixedRefreshValues = REFRESH_INTERVAL_OPTIONS.map((option) => String(option))
+  const isCustomRefreshInterval = !fixedRefreshValues.includes(
+    String(settings.refreshIntervalSeconds)
+  )
+  const intervalControlValue = isCustomRefreshInterval
+    ? 'custom'
+    : String(settings.refreshIntervalSeconds)
+  const canEditCustomRefresh = settings.refreshMode === 'auto' && isCustomRefreshInterval
+  const isApiMode = snapshot.authMode === 'api'
+  const isCodex = settings.agentId === 'codex'
+  const hasFiveHourWindow = snapshot.rateLimits.some(
+    (windowState) => windowState.windowMinutes === 300
+  )
+  const isWindowKeeperAvailable = isCodex && snapshot.authMode === 'chatgpt' && hasFiveHourWindow
+  const sourceValue = isApiMode
+    ? copy.apiModeSource
+    : snapshot.rateLimitSource === 'none'
+      ? copy.noData
+      : snapshot.sourceHost
+  const rateLimitWindows = [...snapshot.rateLimits]
+    .sort((a, b) => {
+      // 短窗口(5h)排在前,长窗口(7d)排在后,确保胶囊取到5h优先
+      const am = a.windowMinutes ?? 0
+      const bm = b.windowMinutes ?? 0
+      return am - bm
+    })
+    .map((w) => ({
+      ...w,
+      label:
+        w.label === '7d' && settings.locale === 'zh-CN'
+          ? '1周'
+          : w.label === '5h' && settings.locale === 'zh-CN'
+            ? '5小时'
+            : w.label
+    }))
+  // 所有窗口都用 QuotaCard 展示(5h+7d);胶囊百分比+进度条优先取短窗口,无短窗口则取长窗口兜底
+  const cardWindows = rateLimitWindows
+  const cardWindowCount = cardWindows.length
+  // 胶囊:主指标取"剩余最少的窗口"(瓶颈),两窗口任一耗尽即代表不能用;无有效数据回退短窗口
+  // 下游百分比/进度条/告急色/倒计时都走这个引用,单点改动即全量跟随
+  const windowsWithRemaining = rateLimitWindows.filter((w) => Number.isFinite(w.remainingPercent))
+  const displayedRateLimit =
+    windowsWithRemaining.length > 0
+      ? windowsWithRemaining.reduce((best, w) =>
+          (w.remainingPercent ?? Infinity) < (best.remainingPercent ?? Infinity) ? w : best
+        )
+      : rateLimitWindows[0]
+  // 窗口标签:标识主指标所属额度窗口;>=1440 分钟按长窗口口径显示"1周"/"7d",否则"5h"
+  const capsuleWindowBadge =
+    !isApiMode && displayedRateLimit
+      ? (displayedRateLimit.windowMinutes ?? 0) >= 1440
+        ? settings.locale === 'zh-CN'
+          ? '1周'
+          : '7d'
+        : '5h'
+      : ''
+  // API Key 模式:无订阅额度窗口,主指标改为今日缓存命中率,左槽改为今日 token
+  const apiTodayTotal = capsuleToday?.available === true ? capsuleToday.totals.total : undefined
+  const apiTodayInput = capsuleToday?.available === true ? capsuleToday.totals.input : 0
+  const apiTodayCached = capsuleToday?.available === true ? capsuleToday.totals.cachedInput : 0
+  const apiCacheHit = apiTodayInput > 0 ? (apiTodayCached / apiTodayInput) * 100 : undefined
+  const capsuleDisplayPercent = isApiMode
+    ? apiCacheHit
+    : settings.percentageMode === 'used'
+      ? displayedRateLimit?.usedPercent
+      : displayedRateLimit?.remainingPercent
+  const capsulePercentText =
+    capsuleDisplayPercent === undefined ? '--' : `${Math.round(capsuleDisplayPercent)}%`
+  const capsuleProgressStyle = createMetricProgressStyle(
+    capsuleDisplayPercent,
+    isApiMode ? 'remaining' : settings.percentageMode
+  )
+  const capsuleResetAt = displayedRateLimit?.resetsAt
+  const capsuleResetText = formatCountdownCapsule(capsuleResetAt, nowTick)
+  // API Key 模式左槽:今日 token;OAuth 模式为窗口重置倒计时
+  const capsuleWeeklyText = isApiMode
+    ? apiTodayTotal === undefined
+      ? '--'
+      : formatCapsuleTokens(apiTodayTotal, settings.locale)
+    : capsuleResetText
+  // API Key 模式胶囊数值与自适应字号(长文本自动缩小,不出框)
+  // 竖版仅 50px 宽,字号与最大宽度都比横版收紧
+  const apiTokenText = isApiMode ? capsuleWeeklyText : ''
+  const apiHitText = isApiMode ? capsulePercentText : ''
+  const apiIsOrb = windowPreferences.viewMode === 'orb'
+  const apiTokenFont = fitFontSize(apiTokenText, apiIsOrb ? 12 : 14, apiIsOrb ? 40 : 80)
+  const apiHitFont = fitFontSize(apiHitText, apiIsOrb ? 12 : 14, apiIsOrb ? 44 : 64)
+  const capsuleCreditText = snapshot.resetCredit?.expiresAt
+    ? formatCountdownShort(snapshot.resetCredit.expiresAt, settings.locale)
+    : ''
+  const capsuleViewMode = windowPreferences.viewMode
+  // 告急:remaining 模式剩余<20%,used 模式已用>80%,触发进度条呼吸提醒
+  const goodScore =
+    capsuleDisplayPercent === undefined
+      ? undefined
+      : settings.percentageMode === 'remaining'
+        ? capsuleDisplayPercent
+        : 100 - capsuleDisplayPercent
+  const isCritical = !isApiMode && goodScore !== undefined && goodScore < 20
+  // 胶囊中部指标盒(百分比+进度条):OAuth 显示额度,API 模式显示缓存命中率
+  const capsuleMetricBox = (
+    <div className="capsule__metric-box">
+      <div
+        className={`capsule__percent${justRefreshed ? ' is-just-refreshed' : ''}${isCritical ? ' is-critical' : ''}`}
+      >
+        {capsulePercentText}
+      </div>
+      <span className="capsule__progress" aria-hidden="true">
+        <span />
+      </span>
+    </div>
+  )
+  // 双窗口单窗口行(复用同结构):沙漏+时间(左) → 百分比 → 进度条
+  const renderDualWindowRow = (w: (typeof rateLimitWindows)[number]) => {
+    const pct = settings.percentageMode === 'used' ? w.usedPercent : w.remainingPercent
+    const resetText = formatCountdownCapsule(w.resetsAt, nowTick)
+    return (
+      <div
+        className="capsule__dual-window"
+        style={createMetricProgressStyle(pct, settings.percentageMode)}
+        key={w.id}
+      >
+        <span className="capsule__weekly">
+          <HourglassIcon />
+          <span>{resetText}</span>
+        </span>
+        <span className="capsule__percent">{pct === undefined ? '--' : `${Math.round(pct)}%`}</span>
+        <span className="capsule__progress" aria-hidden="true">
+          <span />
+        </span>
+      </div>
+    )
+  }
+  // 横版中列:双窗口上下排列,每行 = 沙漏+时间 → 百分比 → 进度条
+  const capsuleDualMetricBox = (
+    <div className="capsule__dual-metric">
+      {rateLimitWindows.map((w) => renderDualWindowRow(w))}
+    </div>
+  )
+  // 竖版双窗口:每个窗口 = 沙漏+时间(一行) → 百分比 → 进度条,块与块之间上下排列
+  const renderDualOrbBlock = (w: (typeof rateLimitWindows)[number]) => {
+    const pct = settings.percentageMode === 'used' ? w.usedPercent : w.remainingPercent
+    const resetText = formatCountdownCapsule(w.resetsAt, nowTick)
+    return (
+      <div
+        className="capsule__dual-orb-block"
+        style={createMetricProgressStyle(pct, settings.percentageMode)}
+        key={w.id}
+      >
+        <span className="capsule__weekly">
+          <HourglassIcon />
+          <span>{resetText}</span>
+        </span>
+        <span className="capsule__percent">{pct === undefined ? '--' : `${Math.round(pct)}%`}</span>
+        <span className="capsule__progress" aria-hidden="true">
+          <span />
+        </span>
+      </div>
+    )
+  }
+  const capsuleDualOrbBox = (
+    <div className="capsule__dual-orb">{rateLimitWindows.map((w) => renderDualOrbBlock(w))}</div>
+  )
+  // 胶囊左槽:OAuth 为窗口重置倒计时(沙漏),API 模式为今日 token(由 ApiCapsuleStat 渲染)
+  const capsuleWeeklyOrb = (
+    <div className="capsule__weekly">
+      <HourglassIcon />
+      <span>{capsuleWeeklyText}</span>
+    </div>
+  )
+
+  // API Key 模式胶囊:按内容实际尺寸自适应窗口大小(信息多则大,少则小)。
+  // 临时把胶囊设为 max-content 量出自然尺寸,再让主进程 setSize 贴合。
+  useLayoutEffect(() => {
+    if (!isApiMode || windowRole !== 'capsule' || minimalStage !== 'full') {
+      return
+    }
+    const section = capsuleRef.current
+    if (!section) {
+      return
+    }
+    const prevWidth = section.style.width
+    const prevHeight = section.style.height
+    section.style.width = 'max-content'
+    section.style.height = 'max-content'
+    const width = section.offsetWidth
+    const height = section.offsetHeight
+    section.style.width = prevWidth
+    section.style.height = prevHeight
+    if (width > 0 && height > 0) {
+      void window.chatgptUsage.setCapsuleSize({ width, height })
+    }
+  }, [isApiMode, windowRole, apiTokenText, apiHitText, capsuleViewMode, minimalStage])
+  // 竖版双窗口模式:按内容自适应高度(两行 block 比单窗口高)
+  useLayoutEffect(() => {
+    if (
+      isApiMode ||
+      windowRole !== 'capsule' ||
+      capsuleViewMode !== 'orb' ||
+      minimalStage !== 'full'
+    ) {
+      return
+    }
+    const section = capsuleRef.current
+    if (!section) return
+    if (rateLimitWindows.length < 2) {
+      // 单窗口:上报竖版默认尺寸,覆盖可能残留的双窗口高度或横版尺寸
+      void window.chatgptUsage.setCapsuleSize({ width: 50, height: 96 })
+      return
+    }
+    const prevHeight = section.style.height
+    section.style.height = 'max-content'
+    const height = section.offsetHeight
+    section.style.height = prevHeight
+    if (height > 0) {
+      void window.chatgptUsage.setCapsuleSize({ width: 50, height })
+    }
+  }, [isApiMode, windowRole, capsuleViewMode, minimalStage, rateLimitWindows.length])
+  // 横版双窗口:宽度改用固定计算值,避免切换/拖动在 max-content 测量上的时序差异导致宽窄不一致。
+  // 行宽 = weekly34 + gap4 + percent34 + gap4 + progress46(40+6ml) = 122;+ 左 padding8 = 130。
+  // 高度仍按内容测量(credit + N 行),贴合实际。
+  useLayoutEffect(() => {
+    if (isApiMode || windowRole !== 'capsule' || capsuleViewMode !== 'capsule') {
+      return
+    }
+    const section = capsuleRef.current
+    if (!section) return
+    if (minimalStage !== 'full') {
+      return
+    }
+    const prevHeight = section.style.height
+    section.style.height = 'max-content'
+    const height = section.offsetHeight
+    section.style.height = prevHeight
+    const width = rateLimitWindows.length >= 2 ? DUAL_CAPSULE_WINDOW_WIDTH : section.offsetWidth
+    if (width > 0 && height > 0) {
+      void window.chatgptUsage.setCapsuleSize({ width, height })
+    }
+  }, [
+    isApiMode,
+    windowRole,
+    capsuleViewMode,
+    minimalStage,
+    rateLimitWindows.length,
+    capsuleCreditText
+  ])
+  // 团队额度排行榜:主键 7d(长窗口)剩余降序,7d 相同则次键 5h(短窗口)剩余降序;缺窗口视为最低排末尾。API Key 无订阅额度(恒 0),不参与额度排行
+  const teamPeers = [...(snapshot.teamPeers ?? [])]
+    .filter((peer) => peer.authMode !== 'api')
+    .sort((a, b) => {
+      const aLong = a.longWindow?.remainingPercent ?? -1
+      const bLong = b.longWindow?.remainingPercent ?? -1
+      if (bLong !== aLong) return bLong - aLong
+      const aShort = a.shortWindow?.remainingPercent ?? -1
+      const bShort = b.shortWindow?.remainingPercent ?? -1
+      return bShort - aShort
+    })
+  // Token 消耗排行榜:按选中窗口 token 总量降序(undefined 排末尾);横条按窗口内最大值归一化
+  const teamTokenPeers = [...(snapshot.teamPeers ?? [])].sort((a, b) => {
+    const at = a.tokenUsage?.[teamTokenWindow] ?? -1
+    const bt = b.tokenUsage?.[teamTokenWindow] ?? -1
+    return bt - at
+  })
+  const teamTokenMax = Math.max(
+    1,
+    ...teamTokenPeers.map((peer) => peer.tokenUsage?.[teamTokenWindow] ?? 0)
+  )
+  // 非 Codex 无订阅额度,团队页只留 Token 消耗榜(不显示额度/Token 切换 tab,切换工具即生效)
+  const effectiveTeamBoardMode: 'quota' | 'tokens' = isCodex ? teamBoardMode : 'tokens'
+  // 本机 peer 标识:供回声过滤(自己发的消息只进 panel 流,不驱动胶囊切换)
+  const selfPeerId = snapshot.teamPeers?.find((peer) => peer.isSelf)?.id
+  useEffect(() => {
+    selfPeerIdRef.current = selfPeerId
+  }, [selfPeerId])
+  // 组内最高版本(含 self):排行榜"最新"基准,低于它的成员标黄点
+  const maxAppVersion = (snapshot.teamPeers ?? []).reduce<string | undefined>(
+    (max, peer) =>
+      peer.appVersion !== undefined &&
+      (max === undefined || compareSemver(peer.appVersion, max) > 0)
+        ? peer.appVersion
+        : max,
+    undefined
+  )
+  // 点赞聚合:同一发送者对同一成员以最后一次动作生效,非今日事件不计(与 token 榜 1d 同为自然日)
+  function aggregateReactions(targetPeerId: string): { count: number; selfLiked: boolean } {
+    const todayKey = localDayKey(Date.now())
+    const likedBy = new Map<string, boolean>()
+    for (const r of reactions) {
+      if (r.targetPeerId !== targetPeerId || localDayKey(r.sentAt) !== todayKey) continue
+      likedBy.set(r.senderPeerId, r.action === 'add')
+    }
+    let count = 0
+    for (const liked of likedBy.values()) {
+      if (liked) count++
+    }
+    return { count, selfLiked: likedBy.get(selfPeerIdRef.current ?? '') === true }
+  }
+  // 版本角标跳转:进设置页后滚动到检查更新区(about-row),完成后清除一次性标志
+  useEffect(() => {
+    if (panelView === 'settings' && focusUpdatePending) {
+      aboutRowRef.current?.scrollIntoView({ block: 'nearest' })
+      // 这是一次性定位标志,滚动完成后必须清除;否则后续设置页打开会重复定位。
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setFocusUpdatePending(false)
+    }
+  }, [panelView, focusUpdatePending])
+
+  // panel 重新打开时重置更新态为 idle,打破 downloaded 死端
+  // 场景:1.1.5 下载完不装、1.1.6 发布后重开 panel → 重置 → 重新检查能跳到 1.1.6
+  // panel 内切 tab 不碰 panelRevealRequest,不会触发;红点进来(focusUpdatePending)不打断;
+  // 下载中(downloading)不打断。依赖数组只放 reveal 计数,避免 updateState 变化误触发
+  useEffect(() => {
+    if (!focusUpdatePending && updateState !== 'downloading') {
+      // 面板重新打开时重置更新态,保留现有生命周期时序。
+      // eslint-disable-next-line react-hooks/set-state-in-effect
+      setUpdateState('idle')
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [panelRevealRequest])
+
+  useEffect(() => {
+    if (panelView !== 'team' || !focusTargetPending) {
+      return
+    }
+
+    const target =
+      focusTargetPending === 'announcement' ? announcementRef.current : broadcastFeedRef.current
+    if (!target) {
+      return
+    }
+    target.scrollIntoView({ block: 'nearest' })
+    if (focusTargetPending === 'announcement') {
+      announcementRef.current?.focus({ preventScroll: true })
+    }
+    setFocusTargetPending(null)
+  }, [panelView, focusTargetPending, announcement?.message.id])
+
+  // 只有当前公告卡片进入前台可视区才自动已读；按 id 上报，旧卡片不能误清新公告。
+  useEffect(() => {
+    if (windowRole !== 'panel' || panelView !== 'team' || !announcement) {
+      return
+    }
+
+    const element = announcementRef.current
+    if (!element) {
+      return
+    }
+
+    const announcementId = announcement.message.id
+    const markIfVisible = (): void => {
+      if (
+        announcementVisibleRef.current &&
+        document.visibilityState === 'visible' &&
+        document.hasFocus()
+      ) {
+        void window.chatgptUsage.markAnnouncementRead(announcementId)
+      }
+    }
+    const observer = new IntersectionObserver(([entry]) => {
+      announcementVisibleRef.current = entry.isIntersecting
+      markIfVisible()
+    })
+    observer.observe(element)
+    window.addEventListener('focus', markIfVisible)
+    document.addEventListener('visibilitychange', markIfVisible)
+    return () => {
+      announcementVisibleRef.current = false
+      observer.disconnect()
+      window.removeEventListener('focus', markIfVisible)
+      document.removeEventListener('visibilitychange', markIfVisible)
+    }
+  }, [windowRole, panelView, announcement?.message.id])
+
+  // 新消息入流后把 feed 滚到底,最新可见
+  useEffect(() => {
+    const feed = broadcastFeedRef.current
+    if (feed) {
+      feed.scrollTop = feed.scrollHeight
+    }
+  }, [broadcastMessages.length])
+  // 胶囊消息态跑马灯:文本越长滚动越慢,夹在 6s~20s
+  const capsuleMarqueeDuration = capsuleMessage
+    ? Math.max(
+        CAPSULE_MARQUEE_MIN_MS,
+        Math.min(CAPSULE_MARQUEE_MAX_MS, capsuleMessage.text.length * CAPSULE_MARQUEE_PER_CHAR_MS)
+      )
+    : CAPSULE_MARQUEE_MIN_MS
+  const capsuleMessageLabel = capsuleMessage
+    ? capsuleMessage.senderNickname || copy.teamAnonymous
+    : ''
+  // 测量单份文本是否超过胶囊可视区:横版比宽度,竖版比高度;超了才滚动
+  useLayoutEffect(() => {
+    const text = capsuleMessageTextRef.current
+    const container = text?.closest<HTMLDivElement>('.capsule__message')
+    if (!capsuleMessage || !text || !container) {
+      setCapsuleMessageOverflow(false)
+      return
+    }
+    const overflows =
+      capsuleViewMode === 'orb'
+        ? text.offsetHeight > container.clientHeight
+        : text.offsetWidth > container.clientWidth
+    setCapsuleMessageOverflow(overflows)
+  }, [capsuleMessage, capsuleMessageLabel, capsuleViewMode])
+  const hasUpdate =
+    updateState === 'available' || updateState === 'downloading' || updateState === 'downloaded'
+  // P2P 版本落后:组内广播的最高版本高于本地即提示;与 GitHub 红点角标不叠加
+  const selfOutdated =
+    appVersion !== '' && maxAppVersion !== undefined && compareSemver(appVersion, maxAppVersion) < 0
+  const showOutdatedBadge = selfOutdated && !hasUpdate
+  const capsuleAlert = resolveCapsuleAlert(
+    hasUpdate,
+    announcement?.unread === true,
+    showOutdatedBadge,
+    capsuleMessage !== null
+  )
+  const showMinimalBall = minimalStage === 'minimal' || minimalStage === 'expanding'
+  const canEnterMinimal =
+    settings.capsuleMinimalMode &&
+    windowRole === 'capsule' &&
+    snapshot.generatedAt !== undefined &&
+    capsuleMessage === null &&
+    minimalStage === 'full' &&
+    !pointerInsideCapsule
+  const minimalValueText = isApiMode ? apiTokenText : capsulePercentText
+  const minimalValueColor = isApiMode
+    ? undefined
+    : capsuleDisplayPercent === undefined
+      ? undefined
+      : resolveMetricColor(capsuleDisplayPercent, settings.percentageMode)
+  const minimalValueFont = fitFontSize(
+    minimalValueText,
+    Math.max(10, Math.round(minimalBallSize * 0.36)),
+    Math.max(16, minimalBallSize - 8)
+  )
+  const adjustedMinimalValueFont =
+    settings.theme === 'memphis' && !isApiMode ? Math.min(minimalValueFont, 12) : minimalValueFont
+  const capsuleClassName = [
+    'capsule',
+    `capsule--${capsuleViewMode}`,
+    capsuleAlert === 'red' ? 'has-update' : '',
+    capsuleAlert === 'blue' ? 'has-announcement' : '',
+    capsuleAlert === 'yellow' ? 'is-outdated' : '',
+    snapshot.isRefreshing ? 'is-refreshing' : '',
+    manualRefreshActive ? 'is-manual-refreshing' : '',
+    canRefresh ? '' : 'is-static',
+    capsulePointerActive ? 'is-dragging' : '',
+    showMinimalBall ? 'capsule--minimal' : '',
+    minimalStage === 'expanding' ? 'is-minimal-leaving' : '',
+    minimalStage === 'collapsing' ? 'is-collapsing' : '',
+    minimalReveal ? 'is-revealing' : ''
+  ]
+    .filter(Boolean)
+    .join(' ')
+
+  const detailRows: Array<React.ComponentProps<typeof DetailRow>> = [
+    // 重置卡是订阅(OAuth)专有,API Key 模式不展示
+    ...(!isApiMode && snapshot.resetCredit?.expiresAt
+      ? [
+          {
+            icon: <TicketIcon />,
+            iconTone: 'var(--panel-icon-pink)',
+            label: copy.resetCredit,
+            value: formatCountdownShort(snapshot.resetCredit.expiresAt, settings.locale),
+            hint: formatAbsoluteDate(snapshot.resetCredit.expiresAt, settings.locale)
+          }
+        ]
+      : []),
+    // 雷达是 Codex 专有功能(推荐模型),非 Codex 工具不展示
+    ...(isCodex
+      ? [
+          {
+            icon: <SparkleIcon />,
+            iconTone: 'var(--panel-icon-violet)',
+            label: settings.locale === 'zh-CN' ? '雷达推荐模型' : 'Top model',
+            labelHref: 'https://codex-reset-radar.pages.dev/',
+            value: snapshot.bestModelPick
+              ? formatModelPick(snapshot.bestModelPick.shortLabel)
+              : undefined,
+            valueColor: snapshot.bestModelPick
+              ? resolveModelColor(snapshot.bestModelPick.label)
+              : undefined,
+            hint: snapshot.bestModelPick
+              ? settings.locale === 'zh-CN'
+                ? `IQ ${snapshot.bestModelPick.score.toFixed(1)} · $${snapshot.bestModelPick.averageCostUsd.toFixed(2)}/题`
+                : `IQ ${snapshot.bestModelPick.score.toFixed(1)} · $${snapshot.bestModelPick.averageCostUsd.toFixed(2)}/task`
+              : undefined
+          }
+        ]
+      : []),
+    // 额度特赦重置:静态外链入口,跳转 codex-resets.com 查看官方重置记录(订阅专有,API Key 模式隐藏)
+    ...(isApiMode
+      ? []
+      : [
+          {
+            icon: <ResetIcon />,
+            iconTone: 'var(--panel-icon-green)',
+            label: settings.locale === 'zh-CN' ? '额度重置监测' : 'Usage reset monitor',
+            labelHref: 'https://codex-resets.com/'
+          }
+        ])
+  ]
+
+  // 有窗口带重置倒计时时每秒 tick 刷新显示
+  const hasResetWindow = rateLimitWindows.some((w) => w.resetsAt !== undefined)
+  const hasAnnouncementTime =
+    windowRole === 'panel' && panelView === 'team' && announcement !== null
+  useEffect(() => {
+    const isPanelWithResetWindow =
+      windowRole === 'panel' && panelView === 'details' && hasResetWindow
+    const isCapsuleWithResetWindow = windowRole === 'capsule' && hasResetWindow
+    if (!isPanelWithResetWindow && !isCapsuleWithResetWindow && !hasAnnouncementTime) {
+      return
+    }
+
+    const timer = window.setInterval(() => {
+      setNowTick(Date.now())
+    }, 1000)
+    return () => {
+      window.clearInterval(timer)
+    }
+  }, [windowRole, panelView, hasResetWindow, hasAnnouncementTime])
+
+  // panel 窗口显示时机:隐藏窗口需等新页面完成一帧绘制，避免 show 时先暴露旧帧。
+  useLayoutEffect(() => {
+    if (!ready || windowRole !== 'panel') {
+      return
+    }
+
+    let revealFrame = 0
+    const commitFrame = window.requestAnimationFrame(() => {
+      revealFrame = window.requestAnimationFrame(() => {
+        void window.chatgptUsage.notifyPanelReady()
+      })
+    })
+
+    return () => {
+      window.cancelAnimationFrame(commitFrame)
+      if (revealFrame !== 0) {
+        window.cancelAnimationFrame(revealFrame)
+      }
+    }
+  }, [ready, windowRole, panelRevealRequest])
+
+  // 胶囊显示时机:有数据(generatedAt 存在)后通知主进程显示窗口。
+  // 无数据不通知 → 启动空快照阶段胶囊保持隐藏,避免先大后小闪烁。
+  // 双 rAF 等内容完成一帧绘制再 show,对齐 panel 的防旧帧先露做法。
+  useLayoutEffect(() => {
+    if (!ready || windowRole !== 'capsule') {
+      return
+    }
+    if (snapshot.generatedAt === undefined) {
+      return
+    }
+
+    let revealFrame = 0
+    const commitFrame = window.requestAnimationFrame(() => {
+      revealFrame = window.requestAnimationFrame(() => {
+        void window.chatgptUsage.notifyCapsuleReady()
+      })
+    })
+
+    return () => {
+      window.cancelAnimationFrame(commitFrame)
+      if (revealFrame !== 0) {
+        window.cancelAnimationFrame(revealFrame)
+      }
+    }
+  }, [ready, windowRole, snapshot.generatedAt])
+
+  useEffect(() => {
+    if (!canEnterMinimal) return
+    const timer = window.setTimeout(() => {
+      setMinimalStage('collapsing')
+      minimalStageTimerRef.current = window.setTimeout(() => {
+        minimalStageTimerRef.current = undefined
+        void enterCapsuleMinimal()
+      }, CAPSULE_MINIMAL_COLLAPSE_MS)
+    }, CAPSULE_MINIMAL_TRIGGER_MS)
+    return () => window.clearTimeout(timer)
+  }, [canEnterMinimal])
+
+  useEffect(() => {
+    if (capsuleMessage === null) return
+    if (minimalStageRef.current === 'collapsing') cancelCapsuleCollapse()
+    else if (minimalStageRef.current !== 'full') startCapsuleExpand()
+  }, [capsuleMessage?.id])
+
+  useEffect(() => {
+    if (settings.capsuleMinimalMode) return
+    if (minimalStageRef.current === 'collapsing') cancelCapsuleCollapse()
+    else if (minimalStageRef.current !== 'full') startCapsuleExpand()
+  }, [settings.capsuleMinimalMode])
+
+  async function enterCapsuleMinimal(): Promise<void> {
+    try {
+      await window.chatgptUsage.setCapsuleMinimal({
+        enabled: true,
+        size: { width: minimalBallSize, height: minimalBallSize }
+      })
+      setMinimalStage('minimal')
+    } catch {
+      setMinimalStage('full')
+    }
+  }
+
+  function cancelCapsuleCollapse(): void {
+    if (minimalStageTimerRef.current !== undefined) {
+      window.clearTimeout(minimalStageTimerRef.current)
+      minimalStageTimerRef.current = undefined
+    }
+    setMinimalStage('full')
+  }
+
+  function startCapsuleExpand(): void {
+    if (minimalStageRef.current === 'full') return
+    if (minimalStageTimerRef.current !== undefined) {
+      window.clearTimeout(minimalStageTimerRef.current)
+    }
+    setMinimalStage('expanding')
+    minimalStageTimerRef.current = window.setTimeout(() => {
+      minimalStageTimerRef.current = undefined
+      void exitCapsuleMinimal()
+    }, CAPSULE_MINIMAL_LEAVE_MS)
+  }
+
+  async function exitCapsuleMinimal(): Promise<void> {
+    try {
+      await window.chatgptUsage.setCapsuleMinimal({ enabled: false })
+    } catch {
+      // IPC 失败时仍恢复渲染态,避免胶囊卡在过渡状态
+    }
+    setMinimalStage('full')
+    setMinimalReveal(true)
+    if (minimalRevealTimerRef.current !== undefined) {
+      window.clearTimeout(minimalRevealTimerRef.current)
+    }
+    minimalRevealTimerRef.current = window.setTimeout(() => {
+      minimalRevealTimerRef.current = undefined
+      setMinimalReveal(false)
+    }, CAPSULE_MINIMAL_REVEAL_MS)
+  }
+
+  function closePanel(): void {
+    setPanelView('details')
+    void window.chatgptUsage.closePanel()
+  }
+
+  // 手动检查更新:无更新(含 dev 环境)进 upToDate 态停留几秒,给用户明确反馈
+  async function handleCheckUpdate(): Promise<void> {
+    setUpdateState('checking')
+    setUpdateError('')
+    if (upToDateTimerRef.current !== undefined) {
+      window.clearTimeout(upToDateTimerRef.current)
+    }
+    try {
+      const result = await window.chatgptUsage.checkForUpdate()
+      if (result.available) {
+        setUpdateState('available')
+        setUpdateVersion(result.version ?? '')
+      } else {
+        setUpdateState('upToDate')
+        upToDateTimerRef.current = window.setTimeout(() => {
+          setUpdateState('idle')
+          upToDateTimerRef.current = undefined
+        }, 3000)
+      }
+    } catch (error) {
+      setUpdateState('error')
+      setUpdateError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  async function handleDownloadUpdate(): Promise<void> {
+    setUpdateState('downloading')
+    setUpdateProgress(0)
+    try {
+      await window.chatgptUsage.downloadUpdate()
+    } catch (error) {
+      setUpdateState('error')
+      setUpdateError(error instanceof Error ? error.message : String(error))
+    }
+  }
+
+  function handleInstallUpdate(): void {
+    void window.chatgptUsage.installUpdate()
+  }
+
+  async function handleRefresh(): Promise<void> {
+    if (!canRefresh) {
+      return
+    }
+
+    showManualRefreshFeedback()
+
+    try {
+      const nextSnapshot = await window.chatgptUsage.refreshStatus()
+      setSnapshot(nextSnapshot)
+      triggerJustRefreshed()
+    } catch (error) {
+      recordSnapshotIssue(error)
+    }
+  }
+
+  // 刷新成功后触发百分比弹跳反馈(680ms),与手动刷新扫光错开一点
+  function triggerJustRefreshed(): void {
+    if (justRefreshedTimerRef.current !== undefined) {
+      window.clearTimeout(justRefreshedTimerRef.current)
+    }
+    setJustRefreshed(true)
+    justRefreshedTimerRef.current = window.setTimeout(() => {
+      setJustRefreshed(false)
+      justRefreshedTimerRef.current = undefined
+    }, MANUAL_REFRESH_FEEDBACK_MS)
+  }
+
+  function showManualRefreshFeedback(): void {
+    setManualRefreshActive(true)
+    if (manualRefreshTimerRef.current !== undefined) {
+      window.clearTimeout(manualRefreshTimerRef.current)
+    }
+
+    manualRefreshTimerRef.current = window.setTimeout(() => {
+      setManualRefreshActive(false)
+      manualRefreshTimerRef.current = undefined
+    }, MANUAL_REFRESH_FEEDBACK_MS)
+  }
+
+  function handleCapsulePointerDown(event: React.PointerEvent<HTMLElement>): void {
+    if (event.button !== 0) {
+      return
+    }
+
+    if (minimalStageRef.current !== 'full') {
+      if (minimalStageRef.current === 'collapsing') cancelCapsuleCollapse()
+      else startCapsuleExpand()
+      return
+    }
+
+    const bounds = event.currentTarget.getBoundingClientRect()
+    capsulePointerRef.current = {
+      pointerId: event.pointerId,
+      originScreenX: event.screenX,
+      originScreenY: event.screenY,
+      offsetX: event.clientX - bounds.left,
+      offsetY: event.clientY - bounds.top,
+      hasDragged: false
+    }
+    setCapsulePointerActive(true)
+    event.currentTarget.setPointerCapture(event.pointerId)
+  }
+
+  function handleCapsulePointerMove(event: React.PointerEvent<HTMLElement>): void {
+    const pointerState = capsulePointerRef.current
+    if (!pointerState || pointerState.pointerId !== event.pointerId) {
+      return
+    }
+
+    const distance = Math.hypot(
+      event.screenX - pointerState.originScreenX,
+      event.screenY - pointerState.originScreenY
+    )
+    if (distance < CAPSULE_CLICK_DRAG_DISTANCE && !pointerState.hasDragged) {
+      return
+    }
+
+    pointerState.hasDragged = true
+    event.preventDefault()
+
+    void window.chatgptUsage
+      .moveCapsuleWindow({
+        screenX: event.screenX,
+        screenY: event.screenY,
+        offsetX: pointerState.offsetX,
+        offsetY: pointerState.offsetY
+      })
+      .then((nextWindowPreferences) => {
+        setWindowPreferences(nextWindowPreferences)
+      })
+      .catch(recordSnapshotIssue)
+  }
+
+  function handleCapsulePointerUp(event: React.PointerEvent<HTMLElement>): void {
+    void finishCapsulePointer(event, true)
+  }
+
+  function handleCapsulePointerCancel(event: React.PointerEvent<HTMLElement>): void {
+    void finishCapsulePointer(event, false)
+  }
+
+  function handleCapsulePointerEnter(): void {
+    setPointerInsideCapsule(true)
+    if (minimalStageRef.current === 'collapsing') cancelCapsuleCollapse()
+    else if (minimalStageRef.current !== 'full') startCapsuleExpand()
+  }
+
+  function handleCapsulePointerLeave(): void {
+    setPointerInsideCapsule(false)
+  }
+
+  // 排除上一次形态,避免随机连续重复让特效库显得单调
+  function spawnHeartEffect(): void {
+    const availableKinds = HEART_EFFECT_KINDS.filter(
+      (kind) => kind !== lastHeartEffectKindRef.current
+    )
+    const kind = availableKinds[Math.floor(Math.random() * availableKinds.length)]
+    lastHeartEffectKindRef.current = kind
+    const id = ++heartEffectIdRef.current
+    setHeartEffect({ kind, id })
+    if (heartEffectTimerRef.current !== undefined) {
+      window.clearTimeout(heartEffectTimerRef.current)
+    }
+    heartEffectTimerRef.current = window.setTimeout(() => {
+      heartEffectTimerRef.current = undefined
+      setHeartEffect(null)
+    }, HEART_EFFECT_DURATION_MS)
+  }
+
+  async function finishCapsulePointer(
+    event: React.PointerEvent<HTMLElement>,
+    shouldRefreshOnClick: boolean
+  ): Promise<void> {
+    const pointerState = capsulePointerRef.current
+    if (!pointerState || pointerState.pointerId !== event.pointerId) {
+      return
+    }
+
+    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+      event.currentTarget.releasePointerCapture(event.pointerId)
+    }
+
+    capsulePointerRef.current = null
+    setCapsulePointerActive(false)
+
+    if (pointerState.hasDragged) {
+      try {
+        const nextWindowPreferences = await window.chatgptUsage.finishCapsuleWindowDrag()
+        setWindowPreferences(nextWindowPreferences)
+      } catch (error) {
+        recordSnapshotIssue(error)
+      }
+      return
+    }
+
+    if (shouldRefreshOnClick) {
+      openCapsuleTarget()
+    }
+  }
+
+  function clearCapsuleMessage(): void {
+    setCapsuleMessage(null)
+    if (capsuleMessageTimerRef.current !== undefined) {
+      window.clearTimeout(capsuleMessageTimerRef.current)
+      capsuleMessageTimerRef.current = undefined
+    }
+  }
+
+  // 单一优先级同时决定角标颜色与跳转目标，避免视觉提示和点击行为分叉。
+  // 点击胶囊统一进入详情页;公告/消息角标仅在存在对应内容时定向跳转。
+  function openCapsuleTarget(): void {
+    if (capsuleAlert === 'blue') {
+      void window.chatgptUsage.showPanel('team', {
+        focusTarget: 'announcement',
+        forceOpen: true
+      })
+      return
+    }
+    if (capsuleAlert === 'message') {
+      clearCapsuleMessage()
+      void window.chatgptUsage.showPanel('team', { focusTarget: 'messages', forceOpen: true })
+      return
+    }
+    void window.chatgptUsage.showPanel('details')
+  }
+
+  function handleCapsuleKeyDown(event: React.KeyboardEvent<HTMLElement>): void {
+    if (event.key !== 'Enter' && event.key !== ' ') {
+      return
+    }
+
+    event.preventDefault()
+    if (minimalStageRef.current !== 'full') {
+      if (minimalStageRef.current === 'collapsing') cancelCapsuleCollapse()
+      else startCapsuleExpand()
+      return
+    }
+    openCapsuleTarget()
+  }
+
+  function handlePanelViewChange(view: PanelView): void {
+    if (view === panelView) {
+      return
+    }
+    if (view !== 'team') {
+      announcementVisibleRef.current = false
+      if (teamBoardMotionTimerRef.current !== undefined) {
+        window.clearTimeout(teamBoardMotionTimerRef.current)
+        teamBoardMotionTimerRef.current = undefined
+      }
+      setTeamBoardMotionActive(false)
+    } else {
+      startTeamBoardMotion()
+    }
+    if (tabMotionTimerRef.current !== undefined) {
+      window.clearTimeout(tabMotionTimerRef.current)
+    }
+    setTabMotionView(view)
+    setPanelView(view)
+    tabMotionTimerRef.current = window.setTimeout(() => {
+      setTabMotionView(null)
+      tabMotionTimerRef.current = undefined
+    }, PANEL_TAB_MOTION_CLEAR_MS)
+  }
+
+  function startTeamBoardMotion(): void {
+    if (teamBoardMotionTimerRef.current !== undefined) {
+      window.clearTimeout(teamBoardMotionTimerRef.current)
+    }
+    setTeamBoardMotionActive(true)
+    teamBoardMotionTimerRef.current = window.setTimeout(() => {
+      setTeamBoardMotionActive(false)
+      teamBoardMotionTimerRef.current = undefined
+    }, TEAM_BOARD_MOTION_CLEAR_MS)
+  }
+
+  function handleTeamBoardModeChange(value: string): void {
+    const mode = value as 'quota' | 'tokens'
+    if (mode === teamBoardMode) {
+      return
+    }
+    startTeamBoardMotion()
+    setTeamBoardMode(mode)
+  }
+
+  function handleTeamTokenWindowChange(value: string): void {
+    const usageWindow = value as UsageWindow
+    if (usageWindow === teamTokenWindow) {
+      return
+    }
+    startTeamBoardMotion()
+    setTeamTokenWindow(usageWindow)
+  }
+
+  function recordSnapshotIssue(error: unknown): void {
+    const message = error instanceof Error ? error.message : String(error)
+    setSnapshot((previous) => ({
+      ...previous,
+      isRefreshing: false,
+      issues: Array.from(new Set([message, ...previous.issues])).slice(0, 6)
+    }))
+  }
+
+  // 发送广播:成功清输入(自己消息经主进程回显进 feed);失败按原因提示,保留输入
+  async function handleBroadcastSend(): Promise<void> {
+    const text = broadcastInput.trim()
+    if (!text || broadcastSending) {
+      return
+    }
+    setBroadcastSending(true)
+    setBroadcastSendError('')
+    try {
+      const result = await window.chatgptUsage.sendBroadcast(text)
+      if (result.ok) {
+        setBroadcastInput('')
+      } else {
+        setBroadcastSendError(
+          result.reason === 'not-in-team'
+            ? copy.broadcastNotInTeam
+            : result.reason === 'too-long'
+              ? copy.broadcastInvalid
+              : copy.broadcastRateLimited
+        )
+      }
+    } catch {
+      // IPC 异常:静默保留输入,不误导用户
+    } finally {
+      setBroadcastSending(false)
+    }
+  }
+
+  // 点赞 toggle:按当前聚合状态决定 add/remove;失败静默(未入组时榜单不显示入口,正常不会触发)
+  async function handleReactionToggle(targetPeerId: string): Promise<void> {
+    const selfLiked = aggregateReactions(targetPeerId).selfLiked
+    await window.chatgptUsage.sendReaction(targetPeerId, selfLiked ? 'remove' : 'add')
+  }
+
+  // 消息时间戳:当天只显示 HH:mm,跨天带日期(会话内实时,消息不会太旧)
+  function formatMessageTime(sentAt: number): string {
+    const date = new Date(sentAt)
+    const today = new Date()
+    const sameDay = date.toDateString() === today.toDateString()
+    const time = date.toLocaleTimeString(settings.locale, {
+      hour: '2-digit',
+      minute: '2-digit',
+      hour12: false
+    })
+    return sameDay ? time : `${date.getMonth() + 1}/${date.getDate()} ${time}`
+  }
+
+  async function handleSettingsPatch(patch: Partial<AppSettings>): Promise<void> {
+    const previousSettings = settings
+    setSettings({
+      ...settings,
+      ...patch
+    })
+
+    try {
+      const payload = await window.chatgptUsage.updateSettings(patch)
+      setSettings(payload.settings)
+    } catch {
+      setSettings(previousSettings)
+    }
+  }
+
+  function commitCustomRefreshInterval(): void {
+    if (!canEditCustomRefresh) {
+      setCustomRefreshInput(String(settings.refreshIntervalSeconds))
+      return
+    }
+
+    const parsed = Number.parseInt(customRefreshInput, 10)
+    if (!Number.isFinite(parsed)) {
+      setCustomRefreshInput(String(settings.refreshIntervalSeconds))
+      return
+    }
+
+    const normalized = normalizeCustomRefreshInterval(parsed)
+    setCustomRefreshInput(String(normalized))
+    if (normalized !== settings.refreshIntervalSeconds) {
+      void handleSettingsPatch({ refreshIntervalSeconds: normalized })
+    }
+  }
+
+  function commitIqThreshold(): void {
+    const parsed = Number.parseInt(iqThresholdInput, 10)
+    if (!Number.isFinite(parsed)) {
+      setIqThresholdInput(String(settings.iqThreshold))
+      return
+    }
+
+    const normalized = Math.min(MAX_IQ_THRESHOLD, Math.max(MIN_IQ_THRESHOLD, Math.round(parsed)))
+    setIqThresholdInput(String(normalized))
+    if (normalized !== settings.iqThreshold) {
+      void handleSettingsPatch({ iqThreshold: normalized })
+    }
+  }
+
+  // 团队昵称:trim 后提交;空串保存为 undefined(主进程 normalizeSettings 兜底)
+  function commitTeamNickname(): void {
+    const trimmed = teamNicknameInput.trim()
+    setTeamNicknameInput(trimmed)
+    const normalized = trimmed.length > 0 ? trimmed : undefined
+    if (normalized !== settings.teamNickname) {
+      void handleSettingsPatch({ teamNickname: normalized })
+    }
+  }
+
+  function commitTeamGroup(): void {
+    const trimmed = teamGroupInput.trim()
+    setTeamGroupInput(trimmed)
+    const normalized = trimmed.length > 0 ? trimmed : undefined
+    if (normalized !== settings.teamGroup) {
+      void handleSettingsPatch({ teamGroup: normalized })
+    }
+  }
+
+  function selectRefreshInterval(value: string): void {
+    if (value === 'custom') {
+      const parsed = Number.parseInt(customRefreshInput, 10)
+      const candidate = Number.isFinite(parsed)
+        ? normalizeCustomRefreshInterval(parsed)
+        : DEFAULT_CUSTOM_REFRESH_INTERVAL_SECONDS
+      const nextValue = isFixedRefreshInterval(candidate)
+        ? DEFAULT_CUSTOM_REFRESH_INTERVAL_SECONDS
+        : candidate
+
+      setCustomRefreshInput(String(nextValue))
+      void handleSettingsPatch({ refreshIntervalSeconds: nextValue })
+      return
+    }
+
+    const nextValue = Number(value)
+    setCustomRefreshInput(String(nextValue))
+    void handleSettingsPatch({
+      refreshIntervalSeconds: nextValue
+    })
+  }
+
+  if (!ready) {
+    return <div className="app-shell" />
+  }
+
+  if (windowRole === 'capsule') {
+    return (
+      <div className="app-shell app-shell--capsule" data-theme={settings.theme}>
+        <main className="widget">
+          <section
+            ref={capsuleRef}
+            aria-label={
+              capsuleAlert === 'red' || capsuleAlert === 'yellow'
+                ? copy.checkUpdate
+                : capsuleAlert === 'blue'
+                  ? copy.announcementUnread
+                  : capsuleAlert === 'message'
+                    ? copy.capsuleMessageAria
+                    : copy.details
+            }
+            className={capsuleClassName}
+            style={capsuleProgressStyle}
+            onKeyDown={handleCapsuleKeyDown}
+            onPointerCancel={handleCapsulePointerCancel}
+            onPointerDown={handleCapsulePointerDown}
+            onPointerEnter={handleCapsulePointerEnter}
+            onPointerLeave={handleCapsulePointerLeave}
+            onPointerMove={handleCapsulePointerMove}
+            onPointerUp={handleCapsulePointerUp}
+            role="button"
+            tabIndex={0}
+          >
+            <span className="capsule__deco" aria-hidden="true" />
+            {showMinimalBall ? (
+              <div className="capsule__minimal" aria-hidden="true">
+                <span className="capsule__minimal-deco" />
+                <span
+                  className="capsule__minimal-value"
+                  style={{
+                    color: minimalValueColor,
+                    fontSize: `${adjustedMinimalValueFont}px`
+                  }}
+                >
+                  {minimalValueText}
+                </span>
+              </div>
+            ) : (
+              <>
+                {heartEffect ? <HeartEffect key={heartEffect.id} kind={heartEffect.kind} /> : null}
+                {capsuleMessage ? (
+                  <div
+                    key={capsuleMessage.id}
+                    className={`capsule__message capsule__message--${capsuleViewMode}${
+                      capsuleMessageOverflow ? ' is-marquee' : ''
+                    }`}
+                  >
+                    <div
+                      className={`capsule__message-track${capsuleMessageOverflow ? ' is-marquee' : ''}`}
+                      style={
+                        {
+                          '--capsule-marquee-duration': `${capsuleMarqueeDuration}ms`
+                        } as CSSProperties
+                      }
+                    >
+                      <span className="capsule__message-copy">
+                        <span ref={capsuleMessageTextRef} className="capsule__message-text">
+                          {capsuleMessageLabel}: {capsuleMessage.text}
+                        </span>
+                      </span>
+                      {capsuleMessageOverflow ? (
+                        <span aria-hidden="true" className="capsule__message-copy">
+                          <span className="capsule__message-text">
+                            {capsuleMessageLabel}: {capsuleMessage.text}
+                          </span>
+                        </span>
+                      ) : null}
+                    </div>
+                  </div>
+                ) : capsuleViewMode === 'orb' ? (
+                  <div
+                    className={`capsule__layout capsule__layout--v${isApiMode ? ' capsule__layout--v-api' : ''}`}
+                    aria-hidden="true"
+                  >
+                    {isApiMode ? (
+                      <>
+                        {/* API 模式竖版:缓存命中率(含进度) → 今日 token */}
+                        <ApiCapsuleStat
+                          label={copy.usageCacheHit}
+                          value={apiHitText}
+                          fontPx={apiHitFont}
+                          withProgress
+                        />
+                        <ApiCapsuleStat
+                          label={copy.usageToday}
+                          value={apiTokenText}
+                          fontPx={apiTokenFont}
+                        />
+                      </>
+                    ) : rateLimitWindows.length >= 2 ? (
+                      <>
+                        {capsuleCreditText ? (
+                          <div className="capsule__credit">
+                            <TicketIcon />
+                            <span>{capsuleCreditText}</span>
+                          </div>
+                        ) : null}
+                        {capsuleDualOrbBox}
+                      </>
+                    ) : (
+                      <>
+                        {capsuleCreditText ? (
+                          <div className="capsule__credit">
+                            <TicketIcon />
+                            <span>{capsuleCreditText}</span>
+                          </div>
+                        ) : null}
+                        {capsuleWeeklyOrb}
+                        {capsuleMetricBox}
+                      </>
+                    )}
+                  </div>
+                ) : (
+                  <div
+                    className={`capsule__layout capsule__layout--h${isApiMode ? ' capsule__layout--h-api' : ''}${
+                      !isApiMode && rateLimitWindows.length >= 2 ? ' capsule__layout--h-dual' : ''
+                    }`}
+                    aria-hidden="true"
+                  >
+                    {isApiMode ? (
+                      <>
+                        {/* API 模式横版:今日 token → 缓存命中率(含进度) → 推荐模型 */}
+                        <ApiCapsuleStat
+                          label={copy.usageToday}
+                          value={apiTokenText}
+                          fontPx={apiTokenFont}
+                        />
+                        <ApiCapsuleStat
+                          label={copy.usageCacheHit}
+                          value={apiHitText}
+                          fontPx={apiHitFont}
+                          withProgress
+                        />
+                      </>
+                    ) : (
+                      <>
+                        <div className="capsule__col capsule__col--dual">
+                          {rateLimitWindows.length >= 2 ? (
+                            <>
+                              {capsuleCreditText ? (
+                                <div className="capsule__credit">
+                                  <TicketIcon />
+                                  <span>{capsuleCreditText}</span>
+                                </div>
+                              ) : null}
+                              {capsuleDualMetricBox}
+                            </>
+                          ) : rateLimitWindows.length === 1 ? (
+                            <>
+                              <span className="capsule__weekly">
+                                <HourglassIcon />
+                                {capsuleResetText}
+                              </span>
+                              {capsuleMetricBox}
+                            </>
+                          ) : (
+                            <>
+                              <div className="capsule__col capsule__col--weekly">
+                                <span className="capsule__weekly">
+                                  <HourglassIcon />
+                                  {capsuleResetText}
+                                </span>
+                              </div>
+                              <div className="capsule__col capsule__col--metric">
+                                {capsuleMetricBox}
+                              </div>
+                              <div className="capsule__col capsule__col--right">
+                                {capsuleCreditText ? (
+                                  <div className="capsule__credit">
+                                    <TicketIcon />
+                                    <span>{capsuleCreditText}</span>
+                                  </div>
+                                ) : null}
+                                {capsuleWindowBadge ? (
+                                  <div className="capsule__pick">
+                                    <span>{capsuleWindowBadge}</span>
+                                  </div>
+                                ) : null}
+                              </div>
+                            </>
+                          )}
+                        </div>
+                      </>
+                    )}
+                  </div>
+                )}
+              </>
+            )}
+          </section>
+        </main>
+      </div>
+    )
+  }
+
+  const panelTabMotionClass = tabMotionView === panelView ? ' is-tab-switching' : ''
+  const teamBoardMotionClass = teamBoardMotionActive ? ' is-team-switching' : ''
+
+  return (
+    <div className="app-shell app-shell--panel" data-theme={settings.theme}>
+      <section className={`panel panel--${panelView}`}>
+        <span className="panel__deco" aria-hidden="true" />
+        {panelView === 'details' ? (
+          <div className={`panel__body panel__body--details${panelTabMotionClass}`}>
+            <div className="panel__content" ref={panelContentRef}>
+              <PanelTabs
+                current={panelView}
+                labels={{ details: copy.details, team: copy.team, settings: copy.settings }}
+                onChange={handlePanelViewChange}
+              />
+              <div className="panel__header panel__header--details">
+                <div className="panel__header-title-group">
+                  <h2 className="panel__title">{copy.details}</h2>
+                  {isApiMode ? <span className="details-badge">{copy.apiBadge}</span> : null}
+                </div>
+              </div>
+
+              {!isApiMode && cardWindows.length > 0 ? (
+                <div className={`quota-grid${cardWindowCount === 1 ? ' quota-grid--single' : ''}`}>
+                  {cardWindows.map((windowState, index) => (
+                    <QuotaCard
+                      key={windowState.id}
+                      isAccent={index === 0 && (windowState.windowMinutes ?? Infinity) < 1440}
+                      locale={settings.locale}
+                      modeLabel={settings.percentageMode === 'used' ? copy.used : copy.remaining}
+                      percentageMode={settings.percentageMode}
+                      resetExpiryLabel={copy.resetExpiry}
+                      windowState={windowState}
+                    />
+                  ))}
+                </div>
+              ) : null}
+
+              <UsageCard authMode={snapshot.authMode} locale={settings.locale} />
+
+              <div className="panel__rows">
+                {detailRows.map((row) => (
+                  <DetailRow
+                    key={row.label}
+                    badge={row.badge}
+                    hint={row.hint}
+                    icon={row.icon}
+                    iconTone={row.iconTone}
+                    label={row.label}
+                    labelHref={row.labelHref}
+                    value={row.value}
+                    valueColor={row.valueColor}
+                  />
+                ))}
+              </div>
+              {isWindowKeeperAvailable ? (
+                <WindowKeeperStatusCard
+                  copy={copy}
+                  isEligible={
+                    snapshot.authMode === 'chatgpt' &&
+                    rateLimitWindows.some((windowState) => windowState.windowMinutes === 300)
+                  }
+                  locale={settings.locale}
+                  status={snapshot.windowKeeper}
+                />
+              ) : null}
+            </div>
+
+            <div className="panel__footer">
+              <span className="panel__footer-meta">
+                {sourceValue} · {copy.lastRefreshHint} ·{' '}
+                {formatRelativeDate(snapshot.generatedAt, settings.locale)}
+              </span>
+              <button className="ghost-button" onClick={closePanel} type="button">
+                <CloseIcon />
+                <span>{copy.close}</span>
+              </button>
+            </div>
+          </div>
+        ) : panelView === 'team' ? (
+          <div
+            className={`panel__body panel__body--team${panelTabMotionClass}${teamBoardMotionClass}`}
+          >
+            <div className="panel__content" ref={panelContentRef}>
+              <PanelTabs
+                current={panelView}
+                labels={{ details: copy.details, team: copy.team, settings: copy.settings }}
+                onChange={handlePanelViewChange}
+              />
+              {announcement ? (
+                <section
+                  aria-label={announcement.unread ? copy.announcementUnread : copy.announcement}
+                  aria-live="polite"
+                  className={`team-announcement${announcement.unread ? ' is-unread' : ''}`}
+                  ref={announcementRef}
+                  tabIndex={-1}
+                >
+                  <div className="team-announcement__topline">
+                    <span className="team-announcement__label">{copy.announcement}</span>
+                    <span className="team-announcement__meta">
+                      {announcement.message.senderNickname || copy.teamAnonymous} ·{' '}
+                      {formatAnnouncementTime(
+                        announcement.message.sentAt,
+                        nowTick,
+                        settings.locale
+                      )}
+                    </span>
+                  </div>
+                  <p className="team-announcement__text">{announcement.message.text}</p>
+                  <button
+                    className="team-announcement__acknowledge"
+                    onClick={() =>
+                      void window.chatgptUsage.acknowledgeAnnouncement(announcement.message.id)
+                    }
+                    type="button"
+                  >
+                    {copy.announcementAcknowledge}
+                  </button>
+                </section>
+              ) : null}
+              {isCodex ? (
+                <div className="team-mode-switch">
+                  <SegmentedControl
+                    onChange={handleTeamBoardModeChange}
+                    options={[
+                      { label: copy.teamModeQuota, value: 'quota' },
+                      { label: copy.teamModeTokens, value: 'tokens' }
+                    ]}
+                    value={teamBoardMode}
+                  />
+                </div>
+              ) : null}
+              <div className="panel__header panel__header--team">
+                <div>
+                  <h2 className="panel__title">
+                    {effectiveTeamBoardMode === 'quota' ? copy.teamBoard : copy.teamTokenBoard}
+                  </h2>
+                </div>
+                <button
+                  className={`ghost-button ghost-button--accent team__refresh${
+                    manualRefreshActive ? ' is-refreshing' : ''
+                  }`}
+                  disabled={manualRefreshActive || !canRefresh}
+                  onClick={() => void handleRefresh()}
+                  type="button"
+                  aria-label={copy.refresh}
+                >
+                  <RefreshIcon />
+                  <span>{manualRefreshActive ? copy.refreshing : copy.refresh}</span>
+                </button>
+              </div>
+
+              {effectiveTeamBoardMode === 'tokens' ? (
+                <>
+                  <div className="team-window-switch">
+                    <SegmentedControl
+                      onChange={handleTeamTokenWindowChange}
+                      options={[
+                        { label: copy.usage1d, value: '1d' },
+                        { label: copy.usage7d, value: '7d' },
+                        { label: copy.usage30d, value: '30d' }
+                      ]}
+                      value={teamTokenWindow}
+                    />
+                  </div>
+                  {teamTokenPeers.length > 0 ? (
+                    <div className="team-board" key={`tokens-${teamTokenWindow}`}>
+                      {teamTokenPeers.map((peer, index) => {
+                        const showLikes = teamTokenWindow === '1d'
+                        const like = showLikes ? aggregateReactions(peer.id) : undefined
+                        return (
+                          <TokenRow
+                            appVersion={peer.appVersion}
+                            isLatestVersion={
+                              peer.appVersion !== undefined && maxAppVersion !== undefined
+                                ? compareSemver(peer.appVersion, maxAppVersion) === 0
+                                : undefined
+                            }
+                            isSelf={peer.isSelf}
+                            key={peer.id}
+                            likeCount={like?.count}
+                            locale={settings.locale}
+                            maxTokens={teamTokenMax}
+                            nickname={peer.nickname || copy.teamAnonymous}
+                            onLike={
+                              showLikes ? () => void handleReactionToggle(peer.id) : undefined
+                            }
+                            rank={index + 1}
+                            selfLiked={like?.selfLiked}
+                            tokens={peer.tokenUsage?.[teamTokenWindow]}
+                            tokensByAgent={peer.tokenUsageByAgent?.[teamTokenWindow]}
+                          />
+                        )
+                      })}
+                    </div>
+                  ) : (
+                    <p className="team-empty" key={`tokens-empty-${teamTokenWindow}`}>
+                      {copy.teamEmpty}
+                    </p>
+                  )}
+                </>
+              ) : teamPeers.length > 0 ? (
+                <div className="team-board" key="quota">
+                  {teamPeers.map((peer, index) => (
+                    <TeamRow
+                      key={peer.id}
+                      isSelf={peer.isSelf}
+                      rank={index + 1}
+                      nickname={peer.nickname || copy.teamAnonymous}
+                      remainingPercent={peer.remainingPercent}
+                      shortWindow={peer.shortWindow}
+                      longWindow={peer.longWindow}
+                      resetCreditCount={peer.resetCreditCount}
+                      appVersion={peer.appVersion}
+                      isLatestVersion={
+                        peer.appVersion !== undefined && maxAppVersion !== undefined
+                          ? compareSemver(peer.appVersion, maxAppVersion) === 0
+                          : undefined
+                      }
+                    />
+                  ))}
+                </div>
+              ) : (
+                <p className="team-empty" key="quota-empty">
+                  {copy.teamEmpty}
+                </p>
+              )}
+
+              {/* 广播消息流:会话内仅实时,最新在底;发送经主进程校验与回显 */}
+              <div className="team-broadcast">
+                <div className="team-broadcast__feed" ref={broadcastFeedRef}>
+                  {broadcastMessages.length > 0 ? (
+                    broadcastMessages.map((message) => (
+                      <div className="team-broadcast__item" key={message.id}>
+                        <span className="team-broadcast__name">
+                          {message.senderNickname || copy.teamAnonymous}
+                        </span>
+                        <span className="team-broadcast__time">
+                          {formatMessageTime(message.sentAt)}
+                        </span>
+                        <span className="team-broadcast__text">{message.text}</span>
+                      </div>
+                    ))
+                  ) : (
+                    <p className="team-broadcast__empty">{copy.broadcastEmpty}</p>
+                  )}
+                </div>
+                <div className="team-broadcast__composer">
+                  <input
+                    className="team-broadcast__input"
+                    disabled={broadcastSending}
+                    maxLength={200}
+                    onChange={(event) => {
+                      setBroadcastInput(event.target.value)
+                      if (broadcastSendError) {
+                        setBroadcastSendError('')
+                      }
+                    }}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter') {
+                        void handleBroadcastSend()
+                      }
+                    }}
+                    placeholder={copy.broadcastPlaceholder}
+                    type="text"
+                    value={broadcastInput}
+                  />
+                  <button
+                    className="ghost-button ghost-button--accent team-broadcast__send"
+                    disabled={broadcastSending || broadcastInput.trim().length === 0}
+                    onClick={() => void handleBroadcastSend()}
+                    type="button"
+                  >
+                    {copy.broadcastSend}
+                  </button>
+                </div>
+                {broadcastSendError ? (
+                  <p className="team-broadcast__error">{broadcastSendError}</p>
+                ) : null}
+              </div>
+            </div>
+
+            <div className="panel__footer">
+              <span className="panel__footer-meta">
+                {copy.lastRefreshHint} · {formatRelativeDate(snapshot.generatedAt, settings.locale)}
+              </span>
+              <button className="ghost-button" onClick={closePanel} type="button">
+                <CloseIcon />
+                <span>{copy.close}</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <div className={`panel__body panel__body--settings${panelTabMotionClass}`}>
+            <div className="panel__content" ref={panelContentRef}>
+              <PanelTabs
+                current={panelView}
+                labels={{ details: copy.details, team: copy.team, settings: copy.settings }}
+                onChange={handlePanelViewChange}
+              />
+              <div className="panel__header">
+                <div>
+                  <h2 className="panel__title">{copy.settings}</h2>
+                </div>
+              </div>
+
+              <div className="settings-list">
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.groupAppearance}</p>
+                  <SettingField label={copy.theme} hint={copy.themeHint}>
+                    <SegmentedControl
+                      scrollable
+                      onChange={(value) => {
+                        void handleSettingsPatch({ theme: value as ThemeId })
+                      }}
+                      options={THEME_OPTIONS.map((option) => ({
+                        label: option.label,
+                        value: option.value
+                      }))}
+                      value={settings.theme}
+                    />
+                  </SettingField>
+                </div>
+
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.groupAgent}</p>
+                  <SettingField label={copy.agentId} hint={copy.agentIdHint}>
+                    <SegmentedControl
+                      onChange={(value) => {
+                        void handleSettingsPatch({
+                          agentId: value as AppSettings['agentId']
+                        })
+                      }}
+                      options={[
+                        { label: 'Codex', value: 'codex' },
+                        { label: 'Claude Code', value: 'claude' },
+                        { label: 'OpenCode', value: 'opencode' }
+                      ]}
+                      value={settings.agentId}
+                    />
+                  </SettingField>
+                  <div className="setting-stack tool-settings-list">
+                    {isWindowKeeperAvailable ? (
+                      <div className="setting-row tool-setting-row">
+                        <div className="tool-setting-copy">
+                          <span className="setting-field__label">{copy.autoKeep5hWindow}</span>
+                          <small className="setting-field__hint">
+                            {settings.locale === 'zh-CN'
+                              ? '在当前 5h 窗口到期后自动启动下一窗口'
+                              : 'Start the next 5h window after the current window expires'}
+                          </small>
+                        </div>
+                        <ToggleSwitch
+                          checked={settings.autoKeep5hWindow}
+                          offLabel={copy.disabled}
+                          onChange={(checked) => {
+                            void handleSettingsPatch({ autoKeep5hWindow: checked })
+                          }}
+                          onLabel={copy.enabled}
+                        />
+                      </div>
+                    ) : null}
+                    <IslandSettingsCard
+                      locale={settings.locale}
+                      onChange={(island) => void handleSettingsPatch({ island })}
+                      preferences={settings.island}
+                      snapshot={islandSnapshot}
+                    />
+                  </div>
+                </div>
+
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.groupRefresh}</p>
+                  <SettingField label={copy.refreshMode}>
+                    <SegmentedControl
+                      onChange={(value) => {
+                        void handleSettingsPatch({
+                          refreshMode: value as AppSettings['refreshMode']
+                        })
+                      }}
+                      options={[
+                        { label: copy.auto, value: 'auto' },
+                        { label: copy.manual, value: 'manual' }
+                      ]}
+                      value={settings.refreshMode}
+                    />
+                  </SettingField>
+
+                  <SettingField label={copy.refreshInterval}>
+                    <div className="setting-stack">
+                      <SegmentedControl
+                        disabled={settings.refreshMode === 'manual'}
+                        onChange={selectRefreshInterval}
+                        options={[
+                          ...REFRESH_INTERVAL_OPTIONS.map((option) => ({
+                            label: `${option}s`,
+                            value: String(option)
+                          })),
+                          { label: copy.custom, value: 'custom' }
+                        ]}
+                        value={intervalControlValue}
+                      />
+                      {intervalControlValue === 'custom' ? (
+                        <label
+                          className={`inline-input ${canEditCustomRefresh ? '' : 'is-disabled'}`}
+                        >
+                          <span>{copy.customInterval}</span>
+                          <input
+                            disabled={!canEditCustomRefresh}
+                            max={MAX_REFRESH_INTERVAL_SECONDS}
+                            min={MIN_REFRESH_INTERVAL_SECONDS}
+                            onBlur={commitCustomRefreshInterval}
+                            onChange={(event) => {
+                              setCustomRefreshInput(event.target.value)
+                            }}
+                            onKeyDown={(event) => {
+                              if (event.key === 'Enter') {
+                                event.currentTarget.blur()
+                              }
+                            }}
+                            step={1}
+                            type="number"
+                            value={customRefreshInput}
+                          />
+                          <em>s</em>
+                        </label>
+                      ) : null}
+                    </div>
+                  </SettingField>
+                </div>
+
+                {isCodex ? (
+                  <div className="settings-section">
+                    <p className="settings-section__title">{copy.groupDisplay}</p>
+                    <SettingField label={copy.percentageMode}>
+                      <SegmentedControl
+                        onChange={(value) => {
+                          void handleSettingsPatch({
+                            percentageMode: value as PercentageMode
+                          })
+                        }}
+                        options={[
+                          { label: copy.remaining, value: 'remaining' },
+                          { label: copy.used, value: 'used' }
+                        ]}
+                        value={settings.percentageMode}
+                      />
+                    </SettingField>
+                  </div>
+                ) : null}
+
+                {isCodex ? (
+                  <div className="settings-section">
+                    <p className="settings-section__title">{copy.groupRecommend}</p>
+                    <SettingField label={copy.iqThreshold} hint={copy.iqThresholdHint}>
+                      <label className="inline-input">
+                        <span>{copy.iqThreshold}</span>
+                        <input
+                          max={MAX_IQ_THRESHOLD}
+                          min={MIN_IQ_THRESHOLD}
+                          onBlur={commitIqThreshold}
+                          onChange={(event) => {
+                            setIqThresholdInput(event.target.value)
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === 'Enter') {
+                              event.currentTarget.blur()
+                            }
+                          }}
+                          step={1}
+                          type="number"
+                          value={iqThresholdInput}
+                        />
+                        <em>IQ</em>
+                      </label>
+                    </SettingField>
+                  </div>
+                ) : null}
+
+                <div className="settings-section settings-section--general">
+                  <p className="settings-section__title">{copy.groupGeneral}</p>
+                  <div className="setting-row">
+                    <span>{copy.launchAtLogin}</span>
+                    <ToggleSwitch
+                      checked={settings.launchAtLogin}
+                      offLabel={copy.disabled}
+                      onChange={(checked) => {
+                        void handleSettingsPatch({ launchAtLogin: checked })
+                      }}
+                      onLabel={copy.enabled}
+                    />
+                  </div>
+                  <div className="setting-row">
+                    <span>{copy.minimalMode}</span>
+                    <ToggleSwitch
+                      checked={settings.capsuleMinimalMode}
+                      offLabel={copy.disabled}
+                      onChange={(checked) => {
+                        void handleSettingsPatch({ capsuleMinimalMode: checked })
+                      }}
+                      onLabel={copy.enabled}
+                    />
+                  </div>
+                </div>
+
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.groupRegion}</p>
+                  <SettingField label={copy.language}>
+                    <SegmentedControl
+                      onChange={(value) => {
+                        void handleSettingsPatch({
+                          locale: value as LocaleCode
+                        })
+                      }}
+                      options={[
+                        { label: '简中', value: 'zh-CN' },
+                        { label: 'English', value: 'en-US' }
+                      ]}
+                      value={settings.locale}
+                    />
+                  </SettingField>
+                </div>
+
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.team}</p>
+                  <SettingField label={copy.teamNickname} hint={copy.teamNicknameHint}>
+                    <label className="inline-input">
+                      <span>{copy.teamNickname}</span>
+                      <input
+                        onBlur={commitTeamNickname}
+                        onChange={(event) => {
+                          setTeamNicknameInput(event.target.value)
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.currentTarget.blur()
+                          }
+                        }}
+                        placeholder="我"
+                        type="text"
+                        value={teamNicknameInput}
+                      />
+                    </label>
+                  </SettingField>
+                  <SettingField label={copy.teamGroup} hint={copy.teamGroupHint}>
+                    <label className="inline-input">
+                      <span>{copy.teamGroup}</span>
+                      <input
+                        onBlur={commitTeamGroup}
+                        onChange={(event) => {
+                          setTeamGroupInput(event.target.value)
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === 'Enter') {
+                            event.currentTarget.blur()
+                          }
+                        }}
+                        type="text"
+                        value={teamGroupInput}
+                      />
+                    </label>
+                  </SettingField>
+                </div>
+
+                <div className="settings-section">
+                  <p className="settings-section__title">{copy.groupAbout}</p>
+                  <div ref={aboutRowRef} className="setting-row about-row">
+                    <div className="about-row__info">
+                      <span className="about-row__label">{copy.currentVersion}</span>
+                      <span className="about-row__version">v{appVersion || '--'}</span>
+                    </div>
+                    {updateState === 'idle' && (
+                      <button
+                        className="ghost-button about-row__btn"
+                        onClick={handleCheckUpdate}
+                        type="button"
+                      >
+                        {copy.checkUpdate}
+                      </button>
+                    )}
+                    {updateState === 'checking' && (
+                      <button className="ghost-button about-row__btn" disabled type="button">
+                        {copy.checking}
+                      </button>
+                    )}
+                    {updateState === 'upToDate' && (
+                      <span className="about-row__badge">{copy.upToDate}</span>
+                    )}
+                    {updateState === 'available' && (
+                      <button
+                        className="ghost-button about-row__btn"
+                        onClick={handleDownloadUpdate}
+                        type="button"
+                      >
+                        {copy.downloadNow} v{updateVersion}
+                      </button>
+                    )}
+                    {updateState === 'downloaded' && (
+                      <button
+                        className="ghost-button about-row__btn"
+                        onClick={handleInstallUpdate}
+                        type="button"
+                      >
+                        {copy.installNow}
+                      </button>
+                    )}
+                    {updateState === 'error' && (
+                      <button
+                        className="ghost-button about-row__btn"
+                        onClick={handleCheckUpdate}
+                        type="button"
+                      >
+                        {copy.retryUpdate}
+                      </button>
+                    )}
+                  </div>
+                  {updateState === 'available' && (
+                    <p className="about-row__hint">
+                      {copy.newVersionAvailable} v{updateVersion}
+                    </p>
+                  )}
+                  {updateState === 'downloading' && (
+                    <div className="update-progress">
+                      <div className="update-progress__bar">
+                        <span
+                          className="update-progress__fill"
+                          style={{ width: `${updateProgress}%` }}
+                        />
+                      </div>
+                      <span className="update-progress__text">
+                        {copy.downloading} {updateProgress}%
+                      </span>
+                    </div>
+                  )}
+                  {updateState === 'downloaded' && (
+                    <p className="about-row__hint">
+                      {copy.downloaded} v{updateVersion}
+                    </p>
+                  )}
+                  {updateState === 'error' && (
+                    <p className="about-row__hint about-row__hint--error">
+                      {copy.updateError}: {updateError}
+                    </p>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="panel__footer">
+              <span className="panel__footer-meta">
+                {copy.author} · wangcong{appVersion ? `  ·  ${copy.version} ${appVersion}` : ''}
+              </span>
+              <button className="ghost-button" onClick={closePanel} type="button">
+                <CloseIcon />
+                <span>{copy.close}</span>
+              </button>
+            </div>
+          </div>
+        )}
+      </section>
+    </div>
+  )
+}
+
+function QuotaCard({
+  isAccent,
+  locale,
+  modeLabel,
+  percentageMode,
+  windowState,
+  resetExpiryLabel
+}: {
+  isAccent?: boolean
+  locale: LocaleCode
+  modeLabel: string
+  percentageMode: PercentageMode
+  windowState: RateLimitWindowSnapshot
+  resetExpiryLabel: string
+}): React.JSX.Element {
+  const displayPercent =
+    percentageMode === 'used' ? windowState?.usedPercent : windowState?.remainingPercent
+  const progressStyle = createMetricProgressStyle(displayPercent, percentageMode)
+  const resetTimeText = formatCapsuleResetTime(windowState?.resetsAt, locale)
+
+  return (
+    <div className={`quota-card${isAccent ? ' is-accent' : ''}`} style={progressStyle}>
+      <div className="quota-card__head">
+        <span className="quota-card__label">{windowState.label}</span>
+        <span className="quota-card__mode">{modeLabel}</span>
+      </div>
+      <div className="quota-card__value">
+        {displayPercent === undefined ? '--' : `${Math.round(displayPercent)}%`}
+      </div>
+      <span className="quota-card__progress" aria-hidden="true">
+        <span />
+      </span>
+      <p className="quota-card__reset">
+        {formatQuotaResetHint(windowState?.resetsInSeconds, locale)}
+      </p>
+      {windowState.resetsAt ? (
+        <p className="quota-card__expiry">
+          {resetExpiryLabel}: {resetTimeText}
+        </p>
+      ) : null}
+    </div>
+  )
+}
+
+function WindowKeeperStatusCard({
+  copy,
+  isEligible,
+  locale,
+  status
+}: {
+  copy: (typeof COPY)[LocaleCode]
+  isEligible: boolean
+  locale: LocaleCode
+  status?: WindowKeeperStatus
+}): React.JSX.Element {
+  const [expanded, setExpanded] = useState(false)
+  const resolvedStatus: WindowKeeperStatus = status ?? { state: 'waiting-data' }
+  const stateLabel = resolveWindowKeeperStateLabel(resolvedStatus.state, isEligible, copy)
+  const nextActionText = resolvedStatus.nextActionAt
+    ? formatAbsoluteDate(resolvedStatus.nextActionAt, locale)
+    : undefined
+
+  return (
+    <div className="window-keeper-expandable">
+      <button
+        aria-controls="window-keeper-details"
+        aria-expanded={expanded}
+        className={`detail-row window-keeper-row${expanded ? ' is-expanded' : ''}`}
+        onClick={() => setExpanded((value) => !value)}
+        type="button"
+      >
+        <span className="detail-row__label-group">
+          <span
+            className="detail-row__icon"
+            style={{ '--icon-tone': 'var(--panel-accent)' } as CSSProperties}
+          >
+            <WindowKeeperIcon />
+          </span>
+          <span className="detail-row__label">{copy.windowKeeper}</span>
+        </span>
+        <span className="detail-row__value-group">
+          <span
+            className={`detail-row__value window-keeper-row__state window-keeper-row__state--${resolvedStatus.state}`}
+          >
+            {stateLabel}
+          </span>
+          {nextActionText ? <span className="detail-row__hint">{nextActionText}</span> : null}
+          <span className="window-keeper-row__chevron" aria-hidden="true">
+            <ChevronDownIcon />
+          </span>
+        </span>
+      </button>
+      <div
+        aria-label={copy.windowKeeper}
+        className="window-keeper-details"
+        hidden={!expanded}
+        id="window-keeper-details"
+        role="region"
+      >
+        <dl className="window-keeper-details__rows">
+          <div className="window-keeper-details__row">
+            <dt>{copy.windowKeeperState}</dt>
+            <dd>{stateLabel}</dd>
+          </div>
+          <div className="window-keeper-details__row">
+            <dt>{copy.windowKeeperNextAction}</dt>
+            <dd>{formatAbsoluteDate(resolvedStatus.nextActionAt, locale)}</dd>
+          </div>
+          <div className="window-keeper-details__row">
+            <dt>{copy.windowKeeperLastTriggered}</dt>
+            <dd>{formatAbsoluteDate(resolvedStatus.lastTriggeredAt, locale)}</dd>
+          </div>
+          <div className="window-keeper-details__row window-keeper-details__row--error">
+            <dt>{copy.windowKeeperRecentError}</dt>
+            <dd>{resolvedStatus.recentError ?? '--'}</dd>
+          </div>
+        </dl>
+      </div>
+    </div>
+  )
+}
+
+function resolveWindowKeeperStateLabel(
+  state: WindowKeeperState,
+  isEligible: boolean,
+  copy: (typeof COPY)[LocaleCode]
+): string {
+  switch (state) {
+    case 'disabled':
+      return copy.windowKeeperDisabled
+    case 'waiting-data':
+      return copy.windowKeeperWaitingData
+    case 'waiting-weekly-reset':
+      return copy.windowKeeperWaitingWeeklyReset
+    case 'waiting-reset':
+      return isEligible ? copy.windowKeeperWaitingReset : copy.windowKeeperWaitingWindow
+    case 'triggering':
+      return copy.windowKeeperTriggering
+    case 'verifying':
+      return copy.windowKeeperVerifying
+    case 'retrying':
+      return copy.windowKeeperRetrying
+    case 'error':
+      return copy.windowKeeperError
+  }
+}
+
+function formatQuotaResetHint(seconds: number | undefined, locale: LocaleCode): string {
+  const duration = formatRelativeDuration(seconds, locale, locale === 'zh-CN')
+  if (!duration) {
+    return '--'
+  }
+
+  return locale === 'zh-CN' ? `${duration}重置` : `resets in ${duration}`
+}
+
+// 用量统计卡片:1/7/30 天 token 与花费,分段切换 + 每日柱状图
+// API Key 模式胶囊统计单元:小标签 + 自适应字号数值 + 可选进度条
+function ApiCapsuleStat({
+  label,
+  value,
+  fontPx,
+  withProgress
+}: {
+  label: string
+  value: string
+  fontPx: number
+  withProgress?: boolean
+}): React.JSX.Element {
+  return (
+    <div className={`capsule__stat${withProgress ? ' capsule__stat--metric' : ''}`}>
+      <span className="capsule__stat-label">{label}</span>
+      <span className="capsule__stat-value" style={{ fontSize: `${fontPx}px` }}>
+        {value}
+      </span>
+      {withProgress ? (
+        <span className="capsule__progress" aria-hidden="true">
+          <span />
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+// 自定义用量区间的上限(天),与主进程扫描窗口一致;超出部分取不到数据
+const MAX_RANGE_DAYS = 30
+const DAY_MS = 24 * 60 * 60 * 1000
+
+const EMPTY_USAGE_OVERVIEW: TokenUsageOverview = {
+  available: false,
+  generatedAt: '',
+  days: [],
+  totals: { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0, cost: 0 },
+  models: []
+}
+
+// 模型用量榜:按 total 降序取 Top 5,其余合并为"其他";每行横条占比 + token + 花费
+function ModelLeaderboard({
+  models,
+  locale
+}: {
+  models: ModelUsage[]
+  locale: LocaleCode
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  const [hoveredModel, setHoveredModel] = useState<string | null>(null)
+  const [hoveredMetaModel, setHoveredMetaModel] = useState<string | null>(null)
+  const grandTotal = models.reduce((sum, model) => sum + model.total, 0)
+  const rows: Array<{ model: string; total: number; cost: number }> = models
+    .slice(0, 5)
+    .map((model) => ({ model: model.model, total: model.total, cost: model.cost }))
+  const rest = models.slice(5)
+  if (rest.length > 0) {
+    rows.push({
+      model: copy.modelOther,
+      total: rest.reduce((sum, model) => sum + model.total, 0),
+      cost: rest.reduce((sum, model) => sum + model.cost, 0)
+    })
+  }
+  return (
+    <div className="model-board">
+      <div className="model-board__title">{copy.modelUsage}</div>
+      {rows.map((row) => {
+        const share = grandTotal > 0 ? Math.round((row.total / grandTotal) * 100) : 0
+        const metaText = `${share}% · ${formatCompactTokens(row.total, locale)} · ${formatUsd(row.cost)}`
+        const nameTruncated = hoveredModel === row.model
+        const metaTruncated = hoveredMetaModel === row.model
+        return (
+          <div className="model-board__row" key={row.model}>
+            <span
+              className="model-board__name"
+              onMouseEnter={(event) => {
+                const el = event.currentTarget
+                setHoveredModel(el.scrollWidth > el.clientWidth ? row.model : null)
+              }}
+              onMouseLeave={() => setHoveredModel(null)}
+            >
+              {row.model}
+            </span>
+            <span className="model-board__track" aria-hidden="true">
+              <span className="model-board__fill" style={{ width: `${share}%` }} />
+            </span>
+            <span
+              className="model-board__meta"
+              onMouseEnter={(event) => {
+                const el = event.currentTarget
+                setHoveredMetaModel(el.scrollWidth > el.clientWidth ? row.model : null)
+              }}
+              onMouseLeave={() => setHoveredMetaModel(null)}
+            >
+              {metaText}
+            </span>
+            {nameTruncated ? <span className="model-board__tooltip">{row.model}</span> : null}
+            {metaTruncated ? (
+              <span className="model-board__tooltip model-board__tooltip--right">{metaText}</span>
+            ) : null}
+          </div>
+        )
+      })}
+    </div>
+  )
+}
+
+function UsageCard({
+  locale,
+  authMode
+}: {
+  locale: LocaleCode
+  authMode: AuthMode
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  // 三个窗口一次性预取,切换按钮即时显示,避免每次切换重新拉取导致的闪烁
+  const [usageByWindow, setUsageByWindow] = useState<
+    Partial<Record<UsageWindow, TokenUsageOverview>>
+  >({})
+  // API Key 模式真实账单花费(窗口维度)
+  const [spendByWindow, setSpendByWindow] = useState<Partial<Record<UsageWindow, SpendUsage>>>({})
+  const [hoveredIndex, setHoveredIndex] = useState<number | undefined>(undefined)
+  // 时间 tab 切换动效:复用页面 tab 切换的 Quick Snap,内容块错峰上浮
+  const [windowMotionActive, setWindowMotionActive] = useState(false)
+  const windowMotionTimerRef = useRef<number | undefined>(undefined)
+
+  useEffect(() => {
+    return () => {
+      if (windowMotionTimerRef.current !== undefined) {
+        window.clearTimeout(windowMotionTimerRef.current)
+      }
+    }
+  }, [])
+
+  const startWindowMotion = (): void => {
+    if (windowMotionTimerRef.current !== undefined) {
+      window.clearTimeout(windowMotionTimerRef.current)
+    }
+    setWindowMotionActive(true)
+    windowMotionTimerRef.current = window.setTimeout(() => {
+      setWindowMotionActive(false)
+      windowMotionTimerRef.current = undefined
+    }, PANEL_TAB_MOTION_CLEAR_MS)
+  }
+
+  // 区间选择:customRange 为空=1/7/30 天预设,有值=自定义起止时间(毫秒)
+  const [presetWindow, setPresetWindow] = useState<UsageWindow>('1d')
+  const [customRange, setCustomRange] = useState<{ startMs: number; endMs: number } | undefined>(
+    undefined
+  )
+  const [rangeOpen, setRangeOpen] = useState(false)
+  const [rangeUsage, setRangeUsage] = useState<TokenUsageOverview | undefined>(undefined)
+  const [rangeLoading, setRangeLoading] = useState(false)
+
+  // 今日小时分布:仅 1d 预设视图拉取,切走即清空
+  const [hourlyData, setHourlyData] = useState<TokenUsageHour[] | undefined>(undefined)
+  const [hourlyHoveredIndex, setHourlyHoveredIndex] = useState<number | undefined>(undefined)
+  // 小时下钻分钟分布:点击某根小时柱后拉取该小时 60 分钟数据
+  const [drillHour, setDrillHour] = useState<number | undefined>(undefined)
+  const [minuteData, setMinuteData] = useState<TokenUsageMinute[] | undefined>(undefined)
+  const [minuteHoveredIndex, setMinuteHoveredIndex] = useState<number | undefined>(undefined)
+
+  useEffect(() => {
+    let cancelled = false
+    for (const w of ['1d', '7d', '30d'] as UsageWindow[]) {
+      window.chatgptUsage
+        .getTokenUsage(w)
+        .then((result) => {
+          if (!cancelled) {
+            setUsageByWindow((prev) => ({ ...prev, [w]: result }))
+          }
+        })
+        .catch(() => {
+          if (!cancelled) {
+            setUsageByWindow((prev) => ({ ...prev, [w]: EMPTY_USAGE_OVERVIEW }))
+          }
+        })
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [])
+
+  // API Key 模式:预取真实账单花费,账单不可用时 UI 回落 token 估算
+  useEffect(() => {
+    if (authMode !== 'api') {
+      return
+    }
+    let cancelled = false
+    for (const w of ['1d', '7d', '30d'] as UsageWindow[]) {
+      window.chatgptUsage
+        .getSpendUsage(w)
+        .then((result) => {
+          if (!cancelled) {
+            setSpendByWindow((prev) => ({ ...prev, [w]: result }))
+          }
+        })
+        .catch(() => {
+          // 忽略:账单失败保持空,回落估算
+        })
+    }
+    return () => {
+      cancelled = true
+    }
+  }, [authMode])
+
+  const isCustom = customRange !== undefined
+  const customStartMs = customRange?.startMs
+  const customEndMs = customRange?.endMs
+
+  // 今日小时分布:仅在 1d 预设视图(非自定义)拉取,复用主进程带 TTL 缓存;
+  // 切走时不主动清空(渲染由 days.length<=1 分支门控,旧数据不会显示)
+  useEffect(() => {
+    if (presetWindow !== '1d' || isCustom || rangeOpen) {
+      return
+    }
+    let cancelled = false
+    window.chatgptUsage
+      .getTokenUsageHourly(Date.now())
+      .then((result) => {
+        if (!cancelled) {
+          setHourlyData(result)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setHourlyData(undefined)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [presetWindow, isCustom, rangeOpen])
+
+  // 小时下钻:点击某小时柱后拉取该小时 60 分钟分布;取消选中时清空
+  useEffect(() => {
+    if (drillHour === undefined) {
+      return
+    }
+    let cancelled = false
+    window.chatgptUsage
+      .getTokenUsageMinutely(Date.now(), drillHour)
+      .then((result) => {
+        if (!cancelled) {
+          setMinuteData(result)
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setMinuteData(undefined)
+        }
+      })
+    return () => {
+      cancelled = true
+    }
+  }, [drillHour])
+
+  const loadCustomRange = (startMs: number, endMs: number): void => {
+    setRangeLoading(true)
+    window.chatgptUsage
+      .getTokenUsageRange(startMs, endMs)
+      .then((result) => {
+        setRangeUsage(result)
+      })
+      .catch(() => {
+        setRangeUsage(EMPTY_USAGE_OVERVIEW)
+      })
+      .finally(() => {
+        setRangeLoading(false)
+      })
+  }
+
+  const usage = usageByWindow[presetWindow]
+  const isLoading = usage === undefined
+  const days = usage?.days ?? []
+  const totals = usage?.totals
+  const hasData = usage?.available === true && totals !== undefined
+  const chartMax = Math.max(
+    1,
+    days.reduce((max, day) => Math.max(max, day.input + day.output), 0)
+  )
+  // API Key 模式:真实账单可用时用账单金额替代 token 估算
+  const spend = spendByWindow[presetWindow]
+  const spendMap =
+    spend?.available === true ? new Map(spend.days.map((d) => [d.date, d.cost])) : undefined
+  const costIsReal = spendMap !== undefined
+  const costValue = costIsReal ? formatUsd(spend?.total ?? 0) : formatUsd(totals?.cost ?? 0)
+
+  // 自定义区间视图数据
+  const rangeTotals = rangeUsage?.totals
+  const rangeDay = rangeUsage?.days[0]
+  const rangeHasData =
+    rangeUsage?.available === true && rangeTotals !== undefined && rangeDay !== undefined
+
+  const models = isCustom ? rangeUsage?.models : usage?.models
+
+  return (
+    <section className={`usage-card${windowMotionActive ? ' is-window-switching' : ''}`}>
+      <div className="usage-card__head">
+        <span className="usage-card__title">{copy.usage}</span>
+      </div>
+
+      <SegmentedControl
+        value={rangeOpen || isCustom ? 'custom' : presetWindow}
+        options={[
+          { label: copy.usage1d, value: '1d' },
+          { label: copy.usage7d, value: '7d' },
+          { label: copy.usage30d, value: '30d' },
+          { label: copy.rangeCustom, value: 'custom' }
+        ]}
+        onChange={(value) => {
+          if (value === 'custom') {
+            if (!rangeOpen) {
+              startWindowMotion()
+            }
+            setRangeOpen(true)
+          } else {
+            const usageWindow = value as UsageWindow
+            // 同一预设且无自定义态时重复点击不重放动效
+            if (usageWindow !== presetWindow || isCustom || rangeOpen) {
+              startWindowMotion()
+            }
+            setPresetWindow(usageWindow)
+            setCustomRange(undefined)
+            setRangeOpen(false)
+          }
+        }}
+      />
+
+      {rangeOpen ? (
+        <RangePanel
+          copy={copy}
+          startMs={customStartMs}
+          endMs={customEndMs}
+          onCustom={(startMs, endMs) => {
+            setCustomRange({ startMs, endMs })
+            setRangeOpen(false)
+            loadCustomRange(startMs, endMs)
+          }}
+        />
+      ) : null}
+
+      {isCustom ? (
+        rangeLoading ? (
+          <p className="usage-card__empty">{copy.refreshing}</p>
+        ) : !rangeHasData ? (
+          <p className="usage-card__empty">{copy.usageEmpty}</p>
+        ) : (
+          <>
+            <div className="usage-summary">
+              <UsageSummaryItem
+                label={copy.usageTotal}
+                value={formatCompactTokens(rangeTotals.total, locale)}
+              />
+              <UsageSummaryItem
+                label={copy.usageInput}
+                value={formatCompactTokens(rangeTotals.input, locale)}
+                tone="input"
+              />
+              <UsageSummaryItem
+                label={copy.usageOutput}
+                value={formatCompactTokens(rangeTotals.output, locale)}
+                tone="output"
+              />
+              <UsageSummaryItem
+                label={copy.usageCacheHit}
+                value={formatCacheHit(rangeTotals.input, rangeTotals.cachedInput)}
+                tone="cached"
+              />
+              <UsageSummaryItem
+                label={copy.usageCost}
+                value={formatUsd(rangeTotals.cost)}
+                tone="cost"
+              />
+            </div>
+            <UsageBar day={rangeDay} locale={locale} />
+            {/* 自定义区间无真实账单口径,始终标注估算 */}
+            <p className="usage-card__spend-hint">{copy.usageEstimated}</p>
+          </>
+        )
+      ) : isLoading ? (
+        <p className="usage-card__empty">{copy.refreshing}</p>
+      ) : !hasData ? (
+        <p className="usage-card__empty">{copy.usageEmpty}</p>
+      ) : (
+        <>
+          <div className="usage-summary">
+            <UsageSummaryItem
+              label={copy.usageTotal}
+              value={formatCompactTokens(totals.total, locale)}
+            />
+            <UsageSummaryItem
+              label={copy.usageInput}
+              value={formatCompactTokens(totals.input, locale)}
+              tone="input"
+            />
+            <UsageSummaryItem
+              label={copy.usageOutput}
+              value={formatCompactTokens(totals.output, locale)}
+              tone="output"
+            />
+            <UsageSummaryItem
+              label={copy.usageCacheHit}
+              value={formatCacheHit(totals.input, totals.cachedInput)}
+              tone="cached"
+            />
+            <UsageSummaryItem label={copy.usageCost} value={costValue} tone="cost" />
+          </div>
+          {days.length <= 1 && days[0] ? (
+            <>
+              <UsageBar day={days[0]} locale={locale} />
+              {hourlyData && hourlyData.some((h) => h.input + h.output > 0) ? (
+                <div className="usage-hourly">
+                  <span className="usage-hourly__title">{copy.usageHourlyToday}</span>
+                  <div
+                    className="usage-chart"
+                    onMouseLeave={() => setHourlyHoveredIndex(undefined)}
+                  >
+                    {hourlyHoveredIndex !== undefined && hourlyData[hourlyHoveredIndex] ? (
+                      <HourlyTooltip
+                        hour={hourlyHoveredIndex}
+                        data={hourlyData[hourlyHoveredIndex]}
+                        locale={locale}
+                      />
+                    ) : null}
+                    {hourlyData.map((h, index) => {
+                      const value = h.input + h.output
+                      const hourlyMax = Math.max(1, ...hourlyData.map((x) => x.input + x.output))
+                      const percent = value > 0 ? Math.max(6, (value / hourlyMax) * 100) : 2
+                      const total = Math.max(1, value)
+                      const newInput = Math.max(0, h.input - h.cachedInput)
+                      const cachedPct = (h.cachedInput / total) * 100
+                      const inputPct = (newInput / total) * 100
+                      const outputPct = (h.output / total) * 100
+                      const isActive = drillHour === index
+                      return (
+                        <div
+                          className={`usage-chart__col${isActive ? ' is-active' : ''}`}
+                          key={h.hour}
+                          onClick={() =>
+                            value > 0 ? setDrillHour(isActive ? undefined : index) : undefined
+                          }
+                          onMouseEnter={() => setHourlyHoveredIndex(index)}
+                        >
+                          <span className="usage-chart__bar-wrap">
+                            <span
+                              className="usage-chart__bar usage-chart__bar--stack"
+                              style={{ height: `${percent}%` }}
+                            >
+                              <span
+                                className="usage-chart__bar-seg is-cached"
+                                style={{ height: `${cachedPct}%` }}
+                              />
+                              <span
+                                className="usage-chart__bar-seg is-input"
+                                style={{ height: `${inputPct}%` }}
+                              />
+                              <span
+                                className="usage-chart__bar-seg is-output"
+                                style={{ height: `${outputPct}%` }}
+                              />
+                            </span>
+                          </span>
+                          <span
+                            className={`usage-chart__date${
+                              shouldShowHourLabel(index) ? '' : ' is-hidden'
+                            }`}
+                          >
+                            {formatHourLabel(h.hour)}
+                          </span>
+                        </div>
+                      )
+                    })}
+                  </div>
+                  {drillHour !== undefined &&
+                  minuteData &&
+                  minuteData.some((m) => m.input + m.output > 0) ? (
+                    <div className="usage-minute">
+                      <span className="usage-hourly__title">
+                        {formatHourLabel(drillHour)} · {copy.usageMinuteRange}
+                      </span>
+                      <div
+                        className="usage-chart"
+                        onMouseLeave={() => setMinuteHoveredIndex(undefined)}
+                      >
+                        {minuteHoveredIndex !== undefined && minuteData[minuteHoveredIndex] ? (
+                          <MinuteTooltip
+                            hour={drillHour}
+                            minute={minuteHoveredIndex}
+                            data={minuteData[minuteHoveredIndex]}
+                            locale={locale}
+                          />
+                        ) : null}
+                        {minuteData.map((m, index) => {
+                          const mValue = m.input + m.output
+                          const minuteMax = Math.max(
+                            1,
+                            ...minuteData.map((x) => x.input + x.output)
+                          )
+                          const mPercent = mValue > 0 ? Math.max(3, (mValue / minuteMax) * 100) : 2
+                          const mTotal = Math.max(1, mValue)
+                          const mNewInput = Math.max(0, m.input - m.cachedInput)
+                          const mCachedPct = (m.cachedInput / mTotal) * 100
+                          const mInputPct = (mNewInput / mTotal) * 100
+                          const mOutputPct = (m.output / mTotal) * 100
+                          return (
+                            <div
+                              className="usage-chart__col"
+                              key={m.minute}
+                              onMouseEnter={() => setMinuteHoveredIndex(index)}
+                            >
+                              <span className="usage-chart__bar-wrap">
+                                <span
+                                  className="usage-chart__bar usage-chart__bar--stack"
+                                  style={{ height: `${mPercent}%` }}
+                                >
+                                  <span
+                                    className="usage-chart__bar-seg is-cached"
+                                    style={{ height: `${mCachedPct}%` }}
+                                  />
+                                  <span
+                                    className="usage-chart__bar-seg is-input"
+                                    style={{ height: `${mInputPct}%` }}
+                                  />
+                                  <span
+                                    className="usage-chart__bar-seg is-output"
+                                    style={{ height: `${mOutputPct}%` }}
+                                  />
+                                </span>
+                              </span>
+                              <span
+                                className={`usage-chart__date${
+                                  shouldShowMinuteLabel(index) ? '' : ' is-hidden'
+                                }`}
+                              >
+                                {formatMinuteLabel(drillHour, m.minute)}
+                              </span>
+                            </div>
+                          )
+                        })}
+                      </div>
+                    </div>
+                  ) : null}
+                  {drillHour === undefined && hourlyData.some((h) => h.input + h.output > 0) ? (
+                    <span className="usage-hourly__hint">{copy.usageMinuteHourHint}</span>
+                  ) : null}
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <div className="usage-chart" onMouseLeave={() => setHoveredIndex(undefined)}>
+              {hoveredIndex !== undefined && days[hoveredIndex] ? (
+                <UsageTooltip
+                  day={days[hoveredIndex]}
+                  index={hoveredIndex}
+                  count={days.length}
+                  locale={locale}
+                  spendMap={spendMap}
+                />
+              ) : null}
+              {days.map((day, index) => {
+                const value = day.input + day.output
+                const percent = value > 0 ? Math.max(6, (value / chartMax) * 100) : 2
+                const total = Math.max(1, value)
+                const newInput = Math.max(0, day.input - day.cachedInput)
+                // 三段占比合计 100%,从下到上:缓存输入 / 新输入 / 输出
+                const cachedPct = (day.cachedInput / total) * 100
+                const inputPct = (newInput / total) * 100
+                const outputPct = (day.output / total) * 100
+                return (
+                  <div
+                    className="usage-chart__col"
+                    key={day.date}
+                    onMouseEnter={() => setHoveredIndex(index)}
+                  >
+                    <span className="usage-chart__bar-wrap">
+                      <span
+                        className="usage-chart__bar usage-chart__bar--stack"
+                        style={{ height: `${percent}%` }}
+                      >
+                        <span
+                          className="usage-chart__bar-seg is-cached"
+                          style={{ height: `${cachedPct}%` }}
+                        />
+                        <span
+                          className="usage-chart__bar-seg is-input"
+                          style={{ height: `${inputPct}%` }}
+                        />
+                        <span
+                          className="usage-chart__bar-seg is-output"
+                          style={{ height: `${outputPct}%` }}
+                        />
+                      </span>
+                    </span>
+                    <span
+                      className={`usage-chart__date${shouldShowDateLabel(days.length, index) ? '' : ' is-hidden'}`}
+                    >
+                      {formatDayLabel(day.date)}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
+          {costIsReal ? <p className="usage-card__spend-hint">{copy.spendReal}</p> : null}
+        </>
+      )}
+      {models && models.length > 0 ? <ModelLeaderboard models={models} locale={locale} /> : null}
+    </section>
+  )
+}
+
+// 自定义区间选择面板:预设窗口 + 起止「日期+时分」输入,点「应用」生效
+function RangePanel({
+  copy,
+  startMs,
+  endMs,
+  onCustom
+}: {
+  copy: (typeof COPY)[LocaleCode]
+  startMs: number | undefined
+  endMs: number | undefined
+  onCustom: (startMs: number, endMs: number) => void
+}): React.JSX.Element {
+  // mount 时取一次当前时间,作为区间回填与日期输入范围的基准(render 期间不调用不纯的 Date.now)
+  const [now] = useState(() => Date.now())
+  const fallbackEnd = endMs ?? now
+  // 默认回填 7 个自然日(今天 00:00 往前 6 天 → 当前时刻),与预设「7天」口径一致;
+  // 若按滚动 7×24h(now-7 天)回填,会因多含前一日尾巴时段而与预设数字明显不同
+  const todayStartMs = (() => {
+    const day = new Date(now)
+    return new Date(day.getFullYear(), day.getMonth(), day.getDate()).getTime()
+  })()
+  const fallbackStart = startMs ?? todayStartMs - 6 * DAY_MS
+  const [startDate, setStartDate] = useState(() => toDateInput(fallbackStart))
+  const [startTime, setStartTime] = useState(() => toTimeInput(fallbackStart))
+  const [endDate, setEndDate] = useState(() => toDateInput(fallbackEnd))
+  const [endTime, setEndTime] = useState(() => toTimeInput(fallbackEnd))
+
+  const minDate = toDateInput(now - (MAX_RANGE_DAYS - 1) * DAY_MS)
+  const maxDate = toDateInput(now)
+
+  const toMs = (date: string, time: string): number | undefined => {
+    if (!date || !time) {
+      return undefined
+    }
+    const ms = new Date(`${date}T${time}`).getTime()
+    return Number.isFinite(ms) ? ms : undefined
+  }
+  const startMsValue = toMs(startDate, startTime)
+  const endMsValue = toMs(endDate, endTime)
+  const valid = startMsValue !== undefined && endMsValue !== undefined && endMsValue > startMsValue
+
+  return (
+    <div className="usage-range-panel">
+      <div className="usage-range-fields">
+        <div className="usage-range-field">
+          <span className="usage-range-field__label">{copy.rangeStart}</span>
+          <input
+            type="date"
+            value={startDate}
+            min={minDate}
+            max={maxDate}
+            onChange={(event) => setStartDate(event.target.value)}
+          />
+          <input
+            type="time"
+            value={startTime}
+            onChange={(event) => setStartTime(event.target.value)}
+          />
+        </div>
+        <div className="usage-range-field">
+          <span className="usage-range-field__label">{copy.rangeEnd}</span>
+          <input
+            type="date"
+            value={endDate}
+            min={minDate}
+            max={maxDate}
+            onChange={(event) => setEndDate(event.target.value)}
+          />
+          <input type="time" value={endTime} onChange={(event) => setEndTime(event.target.value)} />
+        </div>
+      </div>
+      <button
+        className="usage-range-apply"
+        disabled={!valid}
+        type="button"
+        onClick={() => {
+          if (startMsValue !== undefined && endMsValue !== undefined) {
+            onCustom(startMsValue, endMsValue)
+          }
+        }}
+      >
+        {copy.rangeApply}
+      </button>
+    </div>
+  )
+}
+
+function toDateInput(ms: number): string {
+  const dt = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`
+}
+
+function toTimeInput(ms: number): string {
+  const dt = new Date(ms)
+  const pad = (n: number): string => String(n).padStart(2, '0')
+  return `${pad(dt.getHours())}:${pad(dt.getMinutes())}`
+}
+
+// 柱状图 hover 浮层:单日完整明细
+function UsageTooltip({
+  day,
+  index,
+  count,
+  locale,
+  spendMap
+}: {
+  day: TokenUsageDay
+  index: number
+  count: number
+  locale: LocaleCode
+  spendMap?: Map<string, number>
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  // 浮层居中于当前柱,靠边时向内收避免溢出卡片
+  const left = Math.max(15, Math.min(85, ((index + 0.5) / count) * 100))
+  const realCost = spendMap?.get(day.date)
+  const costText = realCost !== undefined ? formatUsd(realCost) : formatUsd(day.cost)
+  return (
+    <div className="usage-tooltip" style={{ left: `${left}%` }}>
+      <div className="usage-tooltip__date">{day.date}</div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageTotal}</span>
+        <span>{formatCompactTokens(day.input + day.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageInput}</span>
+        <span>{formatCompactTokens(day.input, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCached}</span>
+        <span>{formatCompactTokens(day.cachedInput, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCacheHit}</span>
+        <span>{formatCacheHit(day.input, day.cachedInput)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageOutput}</span>
+        <span>{formatCompactTokens(day.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageReasoning}</span>
+        <span>{formatCompactTokens(day.reasoning, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row usage-tooltip__cost">
+        <span>{copy.usageCost}</span>
+        <span>{costText}</span>
+      </div>
+    </div>
+  )
+}
+
+// 今日小时分布图浮层:镜像 UsageTooltip,头部显示 HH:00,无真实账单维度(始终估算)
+function HourlyTooltip({
+  hour,
+  data,
+  locale
+}: {
+  hour: number
+  data: TokenUsageHour
+  locale: LocaleCode
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  // 24 根柱,浮层居中于当前柱,靠边时向内收避免溢出卡片
+  const left = Math.max(15, Math.min(85, ((hour + 0.5) / 24) * 100))
+  return (
+    <div className="usage-tooltip" style={{ left: `${left}%` }}>
+      <div className="usage-tooltip__date">{formatHourLabel(hour)}</div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageTotal}</span>
+        <span>{formatCompactTokens(data.input + data.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageInput}</span>
+        <span>{formatCompactTokens(data.input, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCached}</span>
+        <span>{formatCompactTokens(data.cachedInput, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCacheHit}</span>
+        <span>{formatCacheHit(data.input, data.cachedInput)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageOutput}</span>
+        <span>{formatCompactTokens(data.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageReasoning}</span>
+        <span>{formatCompactTokens(data.reasoning, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row usage-tooltip__cost">
+        <span>{copy.usageCost}</span>
+        <span>{formatUsd(data.cost)}</span>
+      </div>
+    </div>
+  )
+}
+
+// 分钟下钻图浮层:镜像 HourlyTooltip,头部显示 HH:MM,无真实账单维度(始终估算)
+function MinuteTooltip({
+  hour,
+  minute,
+  data,
+  locale
+}: {
+  hour: number
+  minute: number
+  data: TokenUsageMinute
+  locale: LocaleCode
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  // 60 根柱,浮层居中于当前柱,靠边时向内收避免溢出卡片
+  const left = Math.max(15, Math.min(85, ((minute + 0.5) / 60) * 100))
+  return (
+    <div className="usage-tooltip" style={{ left: `${left}%` }}>
+      <div className="usage-tooltip__date">{formatMinuteLabel(hour, minute)}</div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageTotal}</span>
+        <span>{formatCompactTokens(data.input + data.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageInput}</span>
+        <span>{formatCompactTokens(data.input, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCached}</span>
+        <span>{formatCompactTokens(data.cachedInput, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageCacheHit}</span>
+        <span>{formatCacheHit(data.input, data.cachedInput)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageOutput}</span>
+        <span>{formatCompactTokens(data.output, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{copy.usageReasoning}</span>
+        <span>{formatCompactTokens(data.reasoning, locale)}</span>
+      </div>
+      <div className="usage-tooltip__row usage-tooltip__cost">
+        <span>{copy.usageCost}</span>
+        <span>{formatUsd(data.cost)}</span>
+      </div>
+    </div>
+  )
+}
+
+// 1天视图:横向堆叠进度条(输入/缓存/输出分段着色),避免单柱图过于空旷
+function UsageBar({ day, locale }: { day: TokenUsageDay; locale: LocaleCode }): React.JSX.Element {
+  const copy = COPY[locale]
+  const totalTokens = Math.max(1, day.input + day.output)
+  const newInput = Math.max(0, day.input - day.cachedInput)
+  const segments = [
+    { key: 'input', label: copy.usageInput, value: newInput, cls: 'is-input' },
+    { key: 'cached', label: copy.usageCached, value: day.cachedInput, cls: 'is-cached' },
+    { key: 'output', label: copy.usageOutput, value: day.output, cls: 'is-output' }
+  ].filter((s) => s.value > 0)
+  return (
+    <div className="usage-bar">
+      <div className="usage-bar__track">
+        {segments.map((s) => (
+          <span
+            className={`usage-bar__seg ${s.cls}`}
+            key={s.key}
+            style={{ width: `${(s.value / totalTokens) * 100}%` }}
+            title={`${s.label} ${formatCompactTokens(s.value, locale)}`}
+          />
+        ))}
+      </div>
+      <div className="usage-bar__legend">
+        {segments.map((s) => (
+          <span className="usage-bar__legend-item" key={s.key}>
+            <i className={`usage-bar__dot ${s.cls}`} />
+            {s.label} {formatCompactTokens(s.value, locale)}
+          </span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
+function UsageSummaryItem({
+  label,
+  value,
+  tone
+}: {
+  label: string
+  value: string
+  tone?: 'input' | 'output' | 'cached' | 'cost'
+}): React.JSX.Element {
+  return (
+    <div className="usage-summary__item">
+      <span className={`usage-summary__value${tone ? `--${tone}` : ''}`}>{value}</span>
+      <span className="usage-summary__label">{label}</span>
+    </div>
+  )
+}
+
+// 窗口天数多时只标首/末与每 5 天,避免拥挤
+function shouldShowDateLabel(count: number, index: number): boolean {
+  if (count <= 7) {
+    return true
+  }
+  return index % 5 === 0 || index === count - 1
+}
+
+function formatDayLabel(date: string): string {
+  return date.slice(5)
+}
+
+// 今日小时分布图 x 轴标签:24 根柱只显示 0/6/12/18/23 时,避免拥挤
+function shouldShowHourLabel(index: number): boolean {
+  return index % 6 === 0 || index === 23
+}
+
+function formatHourLabel(hour: number): string {
+  return `${String(hour).padStart(2, '0')}:00`
+}
+
+// 分钟下钻图 x 轴标签:60 根柱只显示 0/15/30/45/59 分,避免拥挤
+function shouldShowMinuteLabel(index: number): boolean {
+  return index % 15 === 0 || index === 59
+}
+
+// 分钟下钻图浮层/标题时间格式:HH:MM(传入 hour + minute 两段,避免外部拼装)
+function formatMinuteLabel(hour: number, minute: number): string {
+  return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+// 紧凑数字:zh-CN 用 1.2万 / 3.4亿,其余用 1.2K / 3.4M / 1.1B
+function formatCompactTokens(value: number, locale: LocaleCode): string {
+  if (locale === 'zh-CN') {
+    if (value >= 1e8) return `${trimTrailingZero((value / 1e8).toFixed(1))}亿`
+    if (value >= 1e4) return `${trimTrailingZero((value / 1e4).toFixed(1))}万`
+    return String(Math.round(value))
+  }
+  if (value >= 1e9) return `${trimTrailingZero((value / 1e9).toFixed(1))}B`
+  if (value >= 1e6) return `${trimTrailingZero((value / 1e6).toFixed(1))}M`
+  if (value >= 1e3) return `${trimTrailingZero((value / 1e3).toFixed(1))}K`
+  return String(Math.round(value))
+}
+
+// 胶囊今日 token:万级(1万~9999万)取整不显示小数;亿级沿用公共格式化保留 1 位小数
+function formatCapsuleTokens(value: number, locale: LocaleCode): string {
+  if (locale === 'zh-CN' && value >= 1e4 && value < 1e8) {
+    return `${Math.round(value / 1e4)}万`
+  }
+  return formatCompactTokens(value, locale)
+}
+
+function trimTrailingZero(value: string): string {
+  return value.endsWith('.0') ? value.slice(0, -2) : value
+}
+
+// 胶囊自适应字号:按文本宽度估算(CJK≈1em,数字/字母≈0.55em,符号≈0.3em),
+// 长文本自动缩小,保证不超出给定最大宽度
+function fitFontSize(text: string, basePx: number, maxWidth: number): number {
+  let units = 0
+  for (const ch of text) {
+    if (/[一-鿿]/.test(ch)) units += 1
+    else if (ch === '.' || ch === ',' || ch === '：' || ch === '·') units += 0.3
+    else units += 0.55
+  }
+  if (units <= 0) {
+    return basePx
+  }
+  const fitted = (maxWidth / units) * 0.95
+  return Math.max(10, Math.min(basePx, Math.floor(fitted * 10) / 10))
+}
+
+// 缓存命中率 = cached_input / input(input 含缓存)
+function formatCacheHit(input: number, cached: number): string {
+  if (input <= 0) {
+    return '--'
+  }
+  const rate = (cached / input) * 100
+  return `${rate >= 99.95 ? rate.toFixed(0) : rate.toFixed(1)}%`
+}
+
+function formatUsd(value: number): string {
+  if (!Number.isFinite(value)) {
+    return '--'
+  }
+  if (value <= 0) {
+    return '$0'
+  }
+  if (value >= 100) {
+    return `$${Math.round(value)}`
+  }
+  return `$${value.toFixed(value < 0.01 ? 4 : 2)}`
+}
+
+function DetailRow({
+  badge,
+  icon,
+  iconTone,
+  label,
+  labelHref,
+  value,
+  hint,
+  valueColor
+}: {
+  badge?: string
+  icon: React.JSX.Element
+  iconTone?: string
+  label: string
+  labelHref?: string
+  value?: string
+  hint?: string
+  valueColor?: string
+}): React.JSX.Element {
+  return (
+    <div className="detail-row">
+      <div className="detail-row__label-group">
+        <span
+          className="detail-row__icon"
+          style={iconTone ? ({ '--icon-tone': iconTone } as CSSProperties) : undefined}
+        >
+          {icon}
+        </span>
+        {labelHref ? (
+          <a
+            className="detail-row__link"
+            href={labelHref}
+            onClick={(event) => {
+              event.preventDefault()
+              void window.chatgptUsage.openExternal(labelHref)
+            }}
+            title={labelHref}
+          >
+            {label}
+          </a>
+        ) : (
+          <span className="detail-row__label">{label}</span>
+        )}
+      </div>
+      {value || badge || hint ? (
+        <div className="detail-row__value-group">
+          {value ? (
+            <span
+              className="detail-row__value"
+              style={valueColor ? { color: valueColor } : undefined}
+            >
+              {value}
+            </span>
+          ) : null}
+          {badge ? <span className="detail-row__badge">{badge}</span> : null}
+          {hint ? <span className="detail-row__hint">{hint}</span> : null}
+        </div>
+      ) : null}
+    </div>
+  )
+}
+
+function SettingField({
+  label,
+  hint,
+  children
+}: {
+  label: string
+  hint?: string
+  children: React.ReactNode
+}): React.JSX.Element {
+  return (
+    <div className="setting-field">
+      <span className="setting-field__label">{label}</span>
+      {children}
+      {hint ? <span className="setting-field__hint">{hint}</span> : null}
+    </div>
+  )
+}
+
+// 团队排行榜一行:排名/昵称(前带版本点)/剩余百分比横条+数字/重置卡数量;self 行高亮
+function TeamRow({
+  isSelf,
+  rank,
+  nickname,
+  remainingPercent,
+  shortWindow,
+  longWindow,
+  resetCreditCount,
+  appVersion,
+  isLatestVersion
+}: {
+  isSelf: boolean
+  rank: number
+  nickname: string
+  remainingPercent?: number
+  shortWindow?: { label: string; remainingPercent?: number }
+  longWindow?: { label: string; remainingPercent?: number }
+  resetCreditCount?: number
+  appVersion?: string
+  isLatestVersion?: boolean
+}): React.JSX.Element {
+  const percent =
+    remainingPercent === undefined || !Number.isFinite(remainingPercent)
+      ? undefined
+      : Math.min(100, Math.max(0, remainingPercent))
+  const accent = resolveMetricColor(percent, 'remaining')
+  const rankClass =
+    rank === 1 ? ' is-top-1' : rank === 2 ? ' is-top-2' : rank === 3 ? ' is-top-3' : ''
+  const hasBoth = shortWindow !== undefined && longWindow !== undefined
+  return (
+    <div
+      className={`team-row${isSelf ? ' is-self' : ''}${rankClass}${hasBoth ? ' team-row--dual' : ''}`}
+      style={
+        {
+          '--metric-accent': accent,
+          '--team-row-delay': `${Math.min(rank - 1, TEAM_ROW_STAGGER_MAX_INDEX) * TEAM_ROW_STAGGER_MS}ms`
+        } as CSSProperties
+      }
+    >
+      <span className="team-row__rank">{rank}</span>
+      <span className="team-row__name">
+        <span className="team-row__name-text">
+          {appVersion !== undefined ? (
+            <span
+              className={`team-row__dot${isLatestVersion ? ' is-latest' : ' is-outdated'}`}
+              title={appVersion}
+            />
+          ) : null}
+          {nickname}
+        </span>
+      </span>
+      {hasBoth ? (
+        <div className="team-row__windows">
+          <WindowLine label={shortWindow.label} percent={shortWindow.remainingPercent} />
+          <WindowLine label={longWindow.label} percent={longWindow.remainingPercent} />
+        </div>
+      ) : (
+        <span className="team-row__bar">
+          <span
+            className="team-row__bar-fill"
+            style={{ width: percent === undefined ? 0 : `${percent}%` }}
+          />
+        </span>
+      )}
+      <span className="team-row__value">
+        {percent === undefined ? '--' : `${Math.round(percent)}%`}
+      </span>
+      <span className="team-row__credit">
+        <TicketIcon />
+        <span>{resetCreditCount ?? 0}</span>
+      </span>
+    </div>
+  )
+}
+
+// 团队榜三工具分段颜色:进度条不标文字,颜色区分工具,悬停浮层提示明细
+const AGENT_SEGMENT_COLORS: Record<AgentId, string> = {
+  codex: 'var(--metric-accent, rgba(151, 163, 176, 0.74))',
+  claude: '#ecc05a',
+  opencode: '#b585ff'
+}
+const AGENT_SEGMENT_LABELS: Record<AgentId, string> = {
+  codex: 'Codex',
+  claude: 'Claude',
+  opencode: 'OpenCode'
+}
+
+// Token 消耗排行榜一行:排名/昵称/按窗口最大值归一化的横条/紧凑 token 值;self 行高亮
+function TokenRow({
+  isSelf,
+  rank,
+  nickname,
+  tokens,
+  tokensByAgent,
+  maxTokens,
+  locale,
+  appVersion,
+  isLatestVersion,
+  likeCount,
+  selfLiked,
+  onLike
+}: {
+  isSelf: boolean
+  rank: number
+  nickname: string
+  tokens?: number
+  tokensByAgent?: Partial<Record<AgentId, number>>
+  maxTokens: number
+  locale: LocaleCode
+  appVersion?: string
+  isLatestVersion?: boolean
+  likeCount?: number
+  selfLiked?: boolean
+  onLike?: () => void
+}): React.JSX.Element {
+  const percent = tokens !== undefined ? Math.min(100, Math.max(0, (tokens / maxTokens) * 100)) : 0
+  const rankClass =
+    rank === 1 ? ' is-top-1' : rank === 2 ? ' is-top-2' : rank === 3 ? ' is-top-3' : ''
+  const segments = tokensByAgent
+    ? (['codex', 'claude', 'opencode'] as const)
+        .map((id) => ({ id, tokens: tokensByAgent[id] ?? 0 }))
+        .filter((segment) => segment.tokens > 0)
+    : undefined
+  return (
+    <div
+      className={`team-row team-row--token${isSelf ? ' is-self' : ''}${rankClass}${
+        onLike ? ' is-like' : ''
+      }`}
+      style={
+        {
+          '--team-row-delay': `${Math.min(rank - 1, TEAM_ROW_STAGGER_MAX_INDEX) * TEAM_ROW_STAGGER_MS}ms`
+        } as CSSProperties
+      }
+    >
+      <span className="team-row__rank">{rank}</span>
+      <span className="team-row__name">
+        <span className="team-row__name-text">
+          {appVersion !== undefined ? (
+            <span
+              className={`team-row__dot${isLatestVersion ? ' is-latest' : ' is-outdated'}`}
+              title={appVersion}
+            />
+          ) : null}
+          {nickname}
+        </span>
+        {onLike ? (
+          <button
+            aria-label="点赞"
+            className={`team-row__like${selfLiked ? ' is-liked' : ''}`}
+            onClick={onLike}
+            type="button"
+          >
+            <span className="team-row__like-count">{likeCount ?? 0}</span>
+            <HeartIcon />
+          </button>
+        ) : null}
+      </span>
+      <span className="team-row__bar">
+        {segments && segments.length > 0 ? (
+          <span className="team-row__bar-segments">
+            {segments.map((segment) => (
+              <span
+                className="team-row__bar-segment"
+                key={segment.id}
+                style={{
+                  width: `${Math.min(100, Math.max(0, (segment.tokens / maxTokens) * 100))}%`,
+                  background: AGENT_SEGMENT_COLORS[segment.id]
+                }}
+              />
+            ))}
+          </span>
+        ) : (
+          <span className="team-row__bar-fill" style={{ width: `${percent}%` }} />
+        )}
+      </span>
+      <span className="team-row__value">
+        {tokens === undefined ? '--' : formatCompactTokens(tokens, locale)}
+      </span>
+      {segments && segments.length > 0 ? (
+        <span className="team-row__tooltip" role="tooltip">
+          {(['codex', 'claude', 'opencode'] as const).map((id) => (
+            <span className="team-row__tooltip-row" key={id}>
+              <span
+                className="team-row__tooltip-dot"
+                style={{ background: AGENT_SEGMENT_COLORS[id] }}
+              />
+              <span className="team-row__tooltip-label">{AGENT_SEGMENT_LABELS[id]}</span>
+              <span className="team-row__tooltip-value">
+                {formatCompactTokens(tokensByAgent?.[id] ?? 0, locale)}
+              </span>
+            </span>
+          ))}
+        </span>
+      ) : null}
+    </div>
+  )
+}
+
+function WindowLine({ label, percent }: { label: string; percent?: number }): React.JSX.Element {
+  const safePercent =
+    percent === undefined || !Number.isFinite(percent)
+      ? undefined
+      : Math.min(100, Math.max(0, percent))
+  const accent = resolveMetricColor(safePercent, 'remaining')
+  return (
+    <span className="team-row__window" style={{ '--metric-accent': accent } as CSSProperties}>
+      <span className="team-row__window-label">{label}</span>
+      <span className="team-row__window-bar">
+        <span
+          className="team-row__window-bar-fill"
+          style={{ width: safePercent === undefined ? 0 : `${safePercent}%` }}
+        />
+      </span>
+      <span className="team-row__window-value">
+        {safePercent === undefined ? '--' : `${Math.round(safePercent)}%`}
+      </span>
+    </span>
+  )
+}
+
+function PanelTabs({
+  current,
+  labels,
+  onChange
+}: {
+  current: PanelView
+  labels: { details: string; team: string; settings: string }
+  onChange: (view: PanelView) => void
+}): React.JSX.Element {
+  const tabs: Array<{ key: PanelView; label: string }> = [
+    { key: 'details', label: labels.details },
+    { key: 'team', label: labels.team },
+    { key: 'settings', label: labels.settings }
+  ]
+  return (
+    <div className="panel__tabs" role="tablist">
+      {tabs.map((tab) => (
+        <button
+          aria-selected={tab.key === current}
+          className={`panel__tab${tab.key === current ? ' is-active' : ''}`}
+          key={tab.key}
+          onClick={() => onChange(tab.key)}
+          role="tab"
+          type="button"
+        >
+          {tab.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function SegmentedControl({
+  value,
+  options,
+  onChange,
+  disabled,
+  scrollable
+}: {
+  value: string
+  options: Array<{ label: string; value: string }>
+  onChange: (value: string) => void
+  disabled?: boolean
+  scrollable?: boolean
+}): React.JSX.Element {
+  const scrollRef = useRef<HTMLDivElement | null>(null)
+  const isDraggingRef = useRef(false)
+  const hasDraggedRef = useRef(false)
+  const startXRef = useRef(0)
+  const scrollStartRef = useRef(0)
+
+  // 横滑模式:选中项自动滚动居中,便于 12 项内快速定位
+  useLayoutEffect(() => {
+    if (!scrollable) return
+    const container = scrollRef.current
+    const active = container?.querySelector<HTMLButtonElement>('.is-active')
+    active?.scrollIntoView({ behavior: 'smooth', block: 'nearest', inline: 'center' })
+  }, [value, scrollable])
+
+  // 纵向滚轮转为横向滚动(原生监听 + passive:false 才能 preventDefault)
+  useEffect(() => {
+    if (!scrollable) return
+    const container = scrollRef.current
+    if (!container) return
+    const onWheelNative = (event: WheelEvent): void => {
+      if (container.scrollWidth <= container.clientWidth) return
+      if (Math.abs(event.deltaY) > Math.abs(event.deltaX)) {
+        event.preventDefault()
+        container.scrollLeft += event.deltaY
+      }
+    }
+    container.addEventListener('wheel', onWheelNative, { passive: false })
+    return () => {
+      container.removeEventListener('wheel', onWheelNative)
+    }
+  }, [scrollable])
+
+  const handlePointerDown = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (!scrollable || disabled) return
+    const container = scrollRef.current
+    if (!container || container.scrollWidth <= container.clientWidth) return
+    // 轻点阈值提高到 6px,避免手抖误判为拖动导致点击被吞
+    isDraggingRef.current = true
+    hasDraggedRef.current = false
+    startXRef.current = event.clientX
+    scrollStartRef.current = container.scrollLeft
+    // 不用 setPointerCapture,避免按钮 click 事件被吞;冒泡已足够
+    container.style.cursor = 'grabbing'
+    container.style.userSelect = 'none'
+  }
+
+  const handlePointerMove = (event: React.PointerEvent<HTMLDivElement>): void => {
+    if (!scrollable || !isDraggingRef.current) return
+    const container = scrollRef.current
+    if (!container) return
+    const deltaX = event.clientX - startXRef.current
+    if (Math.abs(deltaX) > 6) {
+      hasDraggedRef.current = true
+    }
+    // 只有超过阈值才滚动,避免轻点微抖动导致位移
+    if (hasDraggedRef.current) {
+      container.scrollLeft = scrollStartRef.current - deltaX
+    }
+  }
+
+  const handlePointerUp = (): void => {
+    if (!scrollable) return
+    const container = scrollRef.current
+    isDraggingRef.current = false
+    if (container) {
+      container.style.cursor = ''
+      container.style.userSelect = ''
+    }
+    // 拖动结束后短暂保留标记,拦截紧接着的 click 事件
+    if (hasDraggedRef.current) {
+      window.setTimeout(() => {
+        hasDraggedRef.current = false
+      }, 80)
+    }
+  }
+
+  const handleOptionClick =
+    (optionValue: string) =>
+    (event: React.MouseEvent<HTMLButtonElement>): void => {
+      if (hasDraggedRef.current) {
+        event.preventDefault()
+        event.stopPropagation()
+        return
+      }
+      onChange(optionValue)
+    }
+
+  return (
+    <div
+      ref={scrollRef}
+      className={`segmented ${disabled ? 'is-disabled' : ''} ${scrollable ? 'segmented--scrollable' : ''}`}
+      onPointerDown={handlePointerDown}
+      onPointerMove={handlePointerMove}
+      onPointerUp={handlePointerUp}
+      onPointerCancel={handlePointerUp}
+    >
+      {options.map((option) => (
+        <button
+          className={option.value === value ? 'is-active' : ''}
+          disabled={disabled}
+          key={option.value}
+          onClick={handleOptionClick(option.value)}
+          type="button"
+        >
+          {option.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+function ToggleSwitch({
+  checked,
+  onChange,
+  onLabel,
+  offLabel
+}: {
+  checked: boolean
+  onChange: (checked: boolean) => void
+  onLabel: string
+  offLabel: string
+}): React.JSX.Element {
+  return (
+    <button
+      aria-checked={checked}
+      aria-label={checked ? onLabel : offLabel}
+      className={`toggle-switch ${checked ? 'is-checked' : ''}`}
+      onClick={() => onChange(!checked)}
+      role="switch"
+      type="button"
+    >
+      <span className="toggle-switch__track" aria-hidden="true">
+        <span className="toggle-switch__thumb" />
+      </span>
+    </button>
+  )
+}
+
+// 额度色:按 goodScore(remaining=显示值,used=100-显示值)从柔粉红(0%)到系统绿(100%)线性插值
+// 100% 剩余→系统绿 #56d36c,0% 剩余→柔粉红 #f87171,中间渐变;无数据返回灰色
+// 危险端用柔粉红替代高饱和橙红,与深青蓝冷调背景协调,不堆霓虹
+function resolveMetricColor(
+  displayPercent: number | undefined,
+  percentageMode: PercentageMode
+): string {
+  if (displayPercent === undefined || !Number.isFinite(displayPercent)) {
+    return 'rgba(158, 168, 179, 0.74)'
+  }
+  const goodScore = percentageMode === 'remaining' ? displayPercent : 100 - displayPercent
+  const t = Math.min(100, Math.max(0, goodScore)) / 100
+  // 柔粉红 (248,113,113) -> 系统绿 (86,211,108)
+  const r = Math.round(248 + (86 - 248) * t)
+  const g = Math.round(113 + (211 - 113) * t)
+  const b = Math.round(113 + (108 - 113) * t)
+  return `rgb(${r}, ${g}, ${b})`
+}
+
+// 推荐模型品牌色:按模型名关键词上色
+// Sol=#eab308, Terra=#3b82f6, Luna=#c7d2e0, GPT-5.5=#00e5ff, 兜底灰蓝
+function resolveModelColor(label: string | undefined): string {
+  if (!label) {
+    return 'rgba(197, 210, 224, 0.85)'
+  }
+  if (label.includes('Sol')) return '#eab308'
+  if (label.includes('Terra')) return '#3b82f6'
+  if (label.includes('Luna')) return '#c7d2e0'
+  if (label.includes('GPT-5.5')) return '#00e5ff'
+  return 'rgba(197, 210, 224, 0.85)'
+}
+
+function createMetricProgressStyle(
+  displayPercent: number | undefined,
+  percentageMode: PercentageMode
+): CSSProperties {
+  const progress =
+    displayPercent === undefined || !Number.isFinite(displayPercent)
+      ? 0
+      : Math.min(100, Math.max(0, displayPercent))
+
+  return {
+    '--metric-progress': `${progress}%`,
+    '--metric-accent': resolveMetricColor(displayPercent, percentageMode)
+  } as CSSProperties
+}
+
+function formatAbsoluteDate(value: string | undefined, locale: LocaleCode): string {
+  if (!value) {
+    return '--'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '--'
+  }
+
+  const now = new Date()
+  const sameYear = date.getFullYear() === now.getFullYear()
+  const sameDay = isSameDay(date, now)
+
+  if (locale === 'zh-CN') {
+    const time = new Intl.DateTimeFormat('zh-CN', {
+      hour: '2-digit',
+      minute: '2-digit'
+    }).format(date)
+
+    if (sameDay) {
+      return `${COPY['zh-CN'].today} ${time}`
+    }
+
+    return sameYear
+      ? `${date.getMonth() + 1}月${date.getDate()}日 ${time}`
+      : `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日 ${time}`
+  }
+
+  const time = new Intl.DateTimeFormat('en-US', {
+    hour: 'numeric',
+    minute: '2-digit'
+  }).format(date)
+
+  if (sameDay) {
+    return `${COPY['en-US'].today}, ${time}`
+  }
+
+  return sameYear
+    ? `${new Intl.DateTimeFormat('en-US', { month: 'short', day: 'numeric' }).format(date)}, ${time}`
+    : `${new Intl.DateTimeFormat('en-US', { year: 'numeric', month: 'short', day: 'numeric' }).format(date)}, ${time}`
+}
+
+function formatRelativeDuration(
+  value: number | undefined,
+  locale: LocaleCode,
+  withSuffix = false
+): string | undefined {
+  if (value === undefined) {
+    return undefined
+  }
+
+  const totalSeconds = Math.max(0, Math.floor(value))
+  const days = Math.floor(totalSeconds / 86400)
+  const hours = Math.floor((totalSeconds % 86400) / 3600)
+  const minutes = Math.floor((totalSeconds % 3600) / 60)
+
+  if (locale === 'zh-CN') {
+    const parts: string[] = []
+    if (days > 0) {
+      parts.push(`${days}天`)
+    }
+    if (hours > 0) {
+      parts.push(`${hours}小时`)
+    }
+    if (minutes > 0 || parts.length === 0) {
+      parts.push(`${minutes}分`)
+    }
+    return `${parts.slice(0, 2).join('')}${withSuffix ? '后' : ''}`
+  }
+
+  const parts: string[] = []
+  if (days > 0) {
+    parts.push(`${days}d`)
+  }
+  if (hours > 0) {
+    parts.push(`${hours}h`)
+  }
+  if (minutes > 0 || parts.length === 0) {
+    parts.push(`${minutes}m`)
+  }
+  return parts.slice(0, 2).join(' ')
+}
+
+// 本地自然日键(YYYY-MM-DD):点赞过期与 token 榜 1d 窗口都按自然日对齐
+function localDayKey(ms: number): string {
+  const d = new Date(ms)
+  const month = String(d.getMonth() + 1).padStart(2, '0')
+  const day = String(d.getDate()).padStart(2, '0')
+  return `${d.getFullYear()}-${month}-${day}`
+}
+
+// semver 比较:按 . 分段数字比较(缺段按 0),a>b 返回正数、相等 0
+function compareSemver(a: string, b: string): number {
+  const pa = a.split('.').map((n) => parseInt(n, 10) || 0)
+  const pb = b.split('.').map((n) => parseInt(n, 10) || 0)
+  const len = Math.max(pa.length, pb.length)
+  for (let i = 0; i < len; i++) {
+    const diff = (pa[i] ?? 0) - (pb[i] ?? 0)
+    if (diff !== 0) return diff
+  }
+  return 0
+}
+
+function formatRelativeDate(value: string | undefined, locale: LocaleCode): string | undefined {
+  if (!value) {
+    return undefined
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return undefined
+  }
+
+  const diffSeconds = Math.max(0, Math.floor((Date.now() - date.getTime()) / 1000))
+  if (diffSeconds < 60) {
+    return locale === 'zh-CN' ? '刚刚' : 'just now'
+  }
+
+  const diffMinutes = Math.floor(diffSeconds / 60)
+  if (diffMinutes < 60) {
+    return locale === 'zh-CN' ? `${diffMinutes}分钟前` : `${diffMinutes}m ago`
+  }
+
+  const diffHours = Math.floor(diffMinutes / 60)
+  if (diffHours < 24) {
+    return locale === 'zh-CN' ? `${diffHours}小时前` : `${diffHours}h ago`
+  }
+
+  const diffDays = Math.floor(diffHours / 24)
+  return locale === 'zh-CN' ? `${diffDays}天前` : `${diffDays}d ago`
+}
+
+function formatCapsuleResetTime(value: string | undefined, locale: LocaleCode): string {
+  if (!value) {
+    return '--'
+  }
+
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '--'
+  }
+
+  const now = new Date()
+  const time = new Intl.DateTimeFormat(locale, {
+    hour: '2-digit',
+    minute: '2-digit'
+  }).format(date)
+
+  if (isSameDay(date, now)) {
+    return time
+  }
+
+  const monthDay = new Intl.DateTimeFormat(locale, {
+    month: 'numeric',
+    day: 'numeric'
+  }).format(date)
+  return `${monthDay} ${time}`
+}
+
+function formatCountdownShort(value: string, locale: LocaleCode): string {
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '--'
+  }
+  const diffMs = date.getTime() - Date.now()
+  if (diffMs <= 0) {
+    return '0m'
+  }
+  const totalMinutes = Math.max(1, Math.ceil(diffMs / 60000))
+  const days = Math.floor(totalMinutes / 1440)
+  if (days >= 1) {
+    return locale === 'zh-CN' ? `${days}天` : `${days}d`
+  }
+  const hours = Math.floor(totalMinutes / 60)
+  if (hours >= 1) {
+    return locale === 'zh-CN' ? `${hours}时` : `${hours}h`
+  }
+  return locale === 'zh-CN' ? `${totalMinutes}分` : `${totalMinutes}m`
+}
+
+// 胶囊周重置倒计时:单单位大写 D/H/M/S,秒级(有天显天,0天显时,0时显分,0分显秒)
+// 与重置卡(formatCountdownShort,中文)区分;胶囊里统一用英文单位更紧凑
+function formatCountdownCapsule(value: string | undefined, nowMs: number): string {
+  if (!value) {
+    return '--'
+  }
+  const date = new Date(value)
+  if (Number.isNaN(date.getTime())) {
+    return '--'
+  }
+  const diffMs = date.getTime() - nowMs
+  if (diffMs <= 0) {
+    return '0S'
+  }
+  const totalSeconds = Math.floor(diffMs / 1000)
+  const days = Math.floor(totalSeconds / 86400)
+  if (days >= 1) {
+    return `${days}D`
+  }
+  const hours = Math.floor(totalSeconds / 3600)
+  if (hours >= 1) {
+    return `${hours}H`
+  }
+  const minutes = Math.floor(totalSeconds / 60)
+  if (minutes >= 1) {
+    return `${minutes}M`
+  }
+  return `${totalSeconds}S`
+}
+
+function formatModelPick(shortLabel: string): string {
+  // shortLabel 形如 "Terra xhigh" -> "Terra Xh", "Sol medium" -> "Sol M", "Luna max" -> "Luna U"
+  const parts = shortLabel.split(/\s+/)
+  if (parts.length < 2) return shortLabel
+  const name = parts[0]
+  const effort = parts.slice(1).join(' ').toLowerCase()
+  const effortAbbr: Record<string, string> = {
+    ultra: 'U',
+    max: 'Mx',
+    xhigh: 'Xh',
+    high: 'H',
+    medium: 'M',
+    low: 'L'
+  }
+  const abbr = effortAbbr[effort] ?? effort.charAt(0).toUpperCase()
+  return `${name} ${abbr}`
+}
+
+function normalizeCustomRefreshInterval(value: number): number {
+  return Math.min(
+    MAX_REFRESH_INTERVAL_SECONDS,
+    Math.max(MIN_REFRESH_INTERVAL_SECONDS, Math.round(value))
+  )
+}
+
+function isFixedRefreshInterval(value: number): boolean {
+  return REFRESH_INTERVAL_OPTIONS.some((option) => option === value)
+}
+
+function isSameDay(left: Date, right: Date): boolean {
+  return (
+    left.getFullYear() === right.getFullYear() &&
+    left.getMonth() === right.getMonth() &&
+    left.getDate() === right.getDate()
+  )
+}
+
+function CloseIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="m7 7 10 10M17 7 7 17"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeWidth="1.85"
+      />
+    </svg>
+  )
+}
+
+// 点赞特效:整个胶囊被爱心动画覆盖,kind 决定形态;key 变化重挂载后参数重新随机
+function HeartEffect({ kind }: { kind: HeartEffectKind }): React.JSX.Element {
+  const params = useMemo(() => buildHeartParams(kind), [kind])
+  return (
+    <div className={`heart-effect heart-effect--${kind}`} aria-hidden="true">
+      <span className="heart-effect__reduced">
+        <HeartIcon />
+      </span>
+      {params.glow ? <span className="heart-effect__glow" /> : null}
+      {params.core ? (
+        <span className="heart-effect__core">
+          <HeartIcon />
+        </span>
+      ) : null}
+      {params.rise.map((heart) => (
+        <span
+          key={heart.key}
+          className="heart-effect__rise"
+          style={
+            {
+              left: heart.left,
+              width: heart.size,
+              height: heart.size,
+              animationDelay: heart.delay,
+              animationDuration: heart.dur,
+              '--heart-drift': heart.drift,
+              '--heart-scale': heart.scale
+            } as CSSProperties
+          }
+        >
+          <HeartIcon />
+        </span>
+      ))}
+      {params.shards.map((shard) => (
+        <span
+          key={shard.key}
+          className="heart-effect__shard"
+          style={
+            {
+              '--shard-x': `${shard.x}px`,
+              '--shard-y': `${shard.y}px`,
+              width: shard.size,
+              height: shard.size,
+              animationDelay: shard.delay
+            } as CSSProperties
+          }
+        >
+          <HeartIcon />
+        </span>
+      ))}
+      {params.orbit.map((orbit) => (
+        <span
+          key={orbit.key}
+          className="heart-effect__orbit"
+          style={
+            {
+              '--orbit-delay': orbit.delay,
+              width: orbit.size,
+              height: orbit.size
+            } as CSSProperties
+          }
+        >
+          <HeartIcon />
+        </span>
+      ))}
+      {params.wave.map((ring) => (
+        <span
+          key={ring.key}
+          className="heart-effect__wave"
+          style={{ '--wave-delay': ring.delay } as CSSProperties}
+        />
+      ))}
+      {params.shooting.map((shoot) => (
+        <span
+          key={shoot.key}
+          className="heart-effect__shooting"
+          style={
+            {
+              '--shoot-left': shoot.left,
+              '--shoot-top': shoot.top,
+              '--ribbon-wave': shoot.wave ?? '6px',
+              width: shoot.size,
+              height: shoot.size,
+              animationDelay: shoot.delay,
+              animationDuration: shoot.dur
+            } as CSSProperties
+          }
+        >
+          <HeartIcon />
+        </span>
+      ))}
+      {kind === 'gift' ? (
+        <span className="heart-effect__gift">
+          <span className="heart-effect__gift-heart">
+            <HeartIcon />
+          </span>
+          <span className="heart-effect__gift-lid" />
+          <span className="heart-effect__gift-box" />
+        </span>
+      ) : null}
+      {kind === 'cupid' ? (
+        <span className="heart-effect__cupid">
+          <span className="heart-effect__cupid-heart">
+            <HeartIcon />
+          </span>
+          <span className="heart-effect__cupid-arrow" />
+        </span>
+      ) : null}
+      {kind === 'balloon' ? (
+        <span className="heart-effect__balloon">
+          <span className="heart-effect__balloon-heart">
+            <HeartIcon />
+          </span>
+          <span className="heart-effect__balloon-string" />
+        </span>
+      ) : null}
+      {kind === 'superlike' ? (
+        <span className="heart-effect__superlike">
+          <span className="heart-effect__superlike-star" />
+          <span className="heart-effect__superlike-heart">
+            <HeartIcon />
+          </span>
+        </span>
+      ) : null}
+      {params.plus ? <span className="heart-effect__plus">+1</span> : null}
+    </div>
+  )
+}
+
+interface HeartEffectParams {
+  glow: boolean
+  core: boolean
+  rise: Array<{
+    key: number
+    left: string
+    size: number
+    delay: string
+    dur: string
+    drift: string
+    scale: number
+  }>
+  shards: Array<{ key: number; x: number; y: number; size: number; delay: string }>
+  orbit: Array<{ key: number; delay: string; size: number }>
+  wave: Array<{ key: number; delay: string }>
+  shooting: Array<{
+    key: number
+    left: string
+    top: string
+    size: number
+    delay: string
+    dur: string
+    wave?: string
+  }>
+  plus: boolean
+}
+
+function buildHeartParams(kind: HeartEffectKind): HeartEffectParams {
+  const rand = (min: number, max: number): number => min + Math.random() * (max - min)
+  const makeRise = (count: number): HeartEffectParams['rise'] =>
+    Array.from({ length: count }, (_, key) => ({
+      key,
+      left: `${rand(2, 96)}%`,
+      size: rand(10, 20),
+      delay: `${rand(0, 400)}ms`,
+      dur: `${rand(1150, 1700)}ms`,
+      drift: `${rand(-18, 18)}px`,
+      scale: rand(0.7, 1.5)
+    }))
+  const makeShards = (count: number, minR: number, maxR: number): HeartEffectParams['shards'] =>
+    Array.from({ length: count }, (_, key) => {
+      const angle = (key / count) * Math.PI * 2
+      return {
+        key,
+        x: Math.round(Math.cos(angle) * rand(minR, maxR)),
+        // 胶囊短轴只有 50px,短轴位移必须收紧;竖版由 CSS 交换长短轴
+        y: Math.round(Math.sin(angle) * rand(12, 20)),
+        size: rand(8, 14),
+        delay: `${rand(0, 90)}ms`
+      }
+    })
+  switch (kind) {
+    case 'rain':
+      return {
+        glow: true,
+        core: false,
+        rise: makeRise(20),
+        shards: [],
+        orbit: [],
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+    case 'bloom':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: makeShards(8, 40, 90),
+        orbit: [],
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+    case 'orbit':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: [],
+        orbit: Array.from({ length: 6 }, (_, key) => ({
+          key,
+          delay: `${key * 75}ms`,
+          size: rand(9, 13)
+        })),
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+    case 'wave':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: [],
+        orbit: [],
+        // 三圈光环依次向外扩散,像声波
+        wave: Array.from({ length: 3 }, (_, key) => ({ key, delay: `${key * 250}ms` })),
+        shooting: [],
+        plus: true
+      }
+    case 'shooting':
+      return {
+        glow: true,
+        core: false,
+        rise: [],
+        shards: [],
+        orbit: [],
+        wave: [],
+        // 起点固定在长轴外侧,横版从左向右、竖版由 CSS 改为从下向上
+        shooting: Array.from({ length: 5 }, (_, key) => ({
+          key,
+          left: '-16px',
+          top: `${rand(15, 85)}%`,
+          size: rand(9, 14),
+          delay: `${key * 90 + rand(0, 40)}ms`,
+          dur: `${rand(900, 1450)}ms`
+        })),
+        plus: true
+      }
+    case 'heartbeat':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: [],
+        orbit: [],
+        wave: Array.from({ length: 2 }, (_, key) => ({ key, delay: `${300 + key * 420}ms` })),
+        shooting: [],
+        plus: true
+      }
+    case 'firework':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: makeShards(12, 55, 105),
+        orbit: [],
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+    case 'hug':
+      return {
+        glow: true,
+        core: true,
+        rise: [],
+        shards: makeShards(2, 82, 96).map((heart) => ({ ...heart, delay: '0ms' })),
+        orbit: [],
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+    case 'ribbon':
+      return {
+        glow: true,
+        core: false,
+        rise: [],
+        shards: [],
+        orbit: [],
+        wave: [],
+        shooting: Array.from({ length: 7 }, (_, key) => ({
+          key,
+          left: '102%',
+          top: `${rand(16, 84)}%`,
+          size: rand(8, 13),
+          delay: `${key * 110}ms`,
+          dur: `${rand(1200, 1550)}ms`,
+          wave: `${key % 2 === 0 ? -6 : 6}px`
+        })),
+        plus: true
+      }
+    case 'gift':
+    case 'cupid':
+    case 'balloon':
+    case 'superlike':
+      return {
+        glow: true,
+        core: false,
+        rise: [],
+        shards: [],
+        orbit: [],
+        wave: [],
+        shooting: [],
+        plus: true
+      }
+  }
+}
+
+function HeartIcon(): React.JSX.Element {
+  return (
+    <svg fill="currentColor" viewBox="0 0 24 24">
+      <path d="M12 21s-6.5-4.2-9-8.1C1.2 10 2.3 6.1 5.5 5.4c2-.4 4 .5 6.5 2.7 2.5-2.2 4.5-3.1 6.5-2.7 3.2.7 4.3 4.6 2.5 7.5-2.5 3.9-9 8.1-9 8.1Z" />
+    </svg>
+  )
+}
+
+function HourglassIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M7 3.75h10M7 20.25h10M7.5 3.75v3.2c0 1.5.9 2.8 2.3 3.3l3.9 1.4c1.4.5 2.3 1.8 2.3 3.3v3.2M16.5 3.75v3.2c0 1.5-.9 2.8-2.3 3.3l-3.9 1.4c-1.4.5-2.3 1.8-2.3 3.3v3.2"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+    </svg>
+  )
+}
+
+function RefreshIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M20 11a8 8 0 1 0-1.5 5M20 5v6h-6"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+    </svg>
+  )
+}
+
+// 额度特赦重置:环形单向箭头(区别于 RefreshIcon 双向箭头),表达"周期/恢复"语义
+function ResetIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M5.6 7A8 8 0 1 1 4 12.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+      <path
+        d="M5 4v4h4"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+    </svg>
+  )
+}
+
+function WindowKeeperIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M6.2 8.2A7 7 0 1 1 5.5 15"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+      <path
+        d="M5.7 5.4v3.7h3.7M12 8.7v3.6l2.4 1.5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.7"
+      />
+    </svg>
+  )
+}
+
+function ChevronDownIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="m7 9 5 5 5-5"
+        stroke="currentColor"
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth="1.75"
+      />
+    </svg>
+  )
+}
+
+function TicketIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M4 8a2 2 0 0 1 2-2h12a2 2 0 0 1 2 2v1.5a1.5 1.5 0 0 0 0 3V16a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-3.5a1.5 1.5 0 0 0 0-3z"
+        stroke="currentColor"
+        strokeLinejoin="round"
+        strokeWidth="1.6"
+      />
+      <path
+        d="M9 8v8"
+        stroke="currentColor"
+        strokeDasharray="1.5 2"
+        strokeLinecap="round"
+        strokeWidth="1.4"
+      />
+    </svg>
+  )
+}
+
+function SparkleIcon(): React.JSX.Element {
+  return (
+    <svg fill="none" viewBox="0 0 24 24">
+      <path
+        d="M12 3l1.8 4.8L18.6 9.6l-4.8 1.8L12 16.2l-1.8-4.8L5.4 9.6l4.8-1.8z"
+        stroke="currentColor"
+        strokeLinejoin="round"
+        strokeWidth="1.6"
+      />
+      <path
+        d="M19 15l.7 1.8L21.5 17.5l-1.8.7L19 20l-.7-1.8L16.5 17.5l1.8-.7z"
+        fill="currentColor"
+      />
+    </svg>
+  )
+}
+
+export default App

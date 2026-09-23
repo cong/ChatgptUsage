@@ -1,0 +1,56 @@
+appId: com.openai.chatgptusage
+productName: ChatgptUsage
+directories:
+  buildResources: build
+files:
+  - 'out/**/*'
+  - 'package.json'
+  - 'build/icon-*.png'
+  - '!**/.vscode/*'
+  - '!**/*.map'
+  - '!**/*.{md,markdown,txt}'
+  - '!{.eslintcache,eslint.config.mjs,.prettierignore,.prettierrc.yaml,.editorconfig}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{.codegraph,.tmp-icons,.qoder,.git,.github}/**'
+  - '!{design_refs,scripts,resources}/**'
+  - '!node_modules/**/*.d.ts'
+  - '!node_modules/**/{test,tests,__tests__,example,examples,doc,docs,license,LICENSE,CHANGELOG.md,README.md,readme.md}'
+  - '!src - 副本/**'
+removePackageScripts: true
+removePackageKeywords: true
+asarUnpack:
+  - build/icon-*.png
+extraResources:
+  - from: resources/hooks
+    to: hooks
+win:
+  executableName: ChatgptUsage
+  icon: build/icon.ico
+  compression: maximum
+  electronLanguages:
+    - zh-CN
+    - en-US
+nsis:
+  artifactName: ChatgptUsage-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  runAfterFinish: true
+dmg:
+  artifactName: ChatgptUsage-${version}.${ext}
+linux:
+  target:
+    - AppImage
+    - deb
+  icon: build/icon-1.png
+  maintainer: electronjs.org
+  category: Utility
+appImage:
+  artifactName: ChatgptUsage-${version}.${ext}
+npmRebuild: false
+publish:
+  provider: github
+  owner: cong
+  repo: ChatgptUsage
