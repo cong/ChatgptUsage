@@ -16,11 +16,11 @@
 
 ### 效果预览
 
-![](.\assets\1.png)
+![](./assets/1.png)
 
-![](.\assets\2.png)
+![](./assets/2.png)
 
-![](.\assets\3.png)
+![](./assets/3.png)
 
 ## 为什么需要这个工具？
 
