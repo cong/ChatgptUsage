@@ -7,8 +7,9 @@ import { readOfficialCodexCredentials } from './quota'
 const BILLING_URL = 'https://api.openai.com/v1/dashboard/billing/usage'
 const BILLING_TIMEOUT_MS = 10_000
 const DAY_MS = 24 * 60 * 60 * 1000
-// 账单按日缓存 24h;价格/消费高频变化下一天一刷足够
+// 历史账单按日缓存 24h；今天仍在产生消费，短缓存以便更新。
 const DAY_CACHE_TTL_MS = 24 * 60 * 60 * 1000
+const TODAY_CACHE_TTL_MS = 5 * 60 * 1000
 const WINDOW_DAYS: Record<UsageWindow, number> = { '1d': 1, '7d': 7, '30d': 30 }
 
 interface DayCacheEntry {
@@ -50,7 +51,8 @@ export async function getSpendUsage(window: UsageWindow): Promise<SpendUsage> {
 // 缓存 + 并发去重:同一日期只发一次请求
 async function fetchDaySpend(apiKey: string, date: string): Promise<number | undefined> {
   const cached = dayCache.get(date)
-  if (cached && Date.now() - cached.fetchedAtMs < DAY_CACHE_TTL_MS) {
+  const ttl = date === toDateKey(new Date()) ? TODAY_CACHE_TTL_MS : DAY_CACHE_TTL_MS
+  if (cached && Date.now() - cached.fetchedAtMs < ttl) {
     return cached.usd
   }
   const pending = inflight.get(date)

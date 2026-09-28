@@ -2021,7 +2021,12 @@ function App(): React.JSX.Element {
                 </div>
               ) : null}
 
-              <UsageCard authMode={snapshot.authMode} locale={settings.locale} />
+              <UsageCard
+                key={settings.agentId}
+                authMode={snapshot.authMode}
+                locale={settings.locale}
+                refreshSignal={`${snapshot.generatedAt ?? ''}:${panelRevealRequest}`}
+              />
 
               <div className="panel__rows">
                 {detailRows.map((row) => (
@@ -2912,13 +2917,21 @@ function ModelLeaderboard({
 
 function UsageCard({
   locale,
-  authMode
+  authMode,
+  refreshSignal
 }: {
   locale: LocaleCode
   authMode: AuthMode
+  refreshSignal: string
 }): React.JSX.Element {
   const copy = COPY[locale]
-  // 三个窗口一次性预取,切换按钮即时显示,避免每次切换重新拉取导致的闪烁
+  const [refreshTick, setRefreshTick] = useState(0)
+  // 本地 session 用量不依赖额度刷新模式；详情页打开期间定时读取新记录。
+  useEffect(() => {
+    const timer = window.setInterval(() => setRefreshTick((tick) => tick + 1), 30_000)
+    return () => window.clearInterval(timer)
+  }, [])
+  // 三个窗口一并读取并在刷新时更新,切换按钮即时显示
   const [usageByWindow, setUsageByWindow] = useState<
     Partial<Record<UsageWindow, TokenUsageOverview>>
   >({})
@@ -2984,7 +2997,7 @@ function UsageCard({
     return () => {
       cancelled = true
     }
-  }, [])
+  }, [refreshSignal, refreshTick])
 
   // API Key 模式:预取真实账单花费,账单不可用时 UI 回落 token 估算
   useEffect(() => {
@@ -3007,7 +3020,7 @@ function UsageCard({
     return () => {
       cancelled = true
     }
-  }, [authMode])
+  }, [authMode, refreshSignal, refreshTick])
 
   const isCustom = customRange !== undefined
   const customStartMs = customRange?.startMs
@@ -3035,7 +3048,7 @@ function UsageCard({
     return () => {
       cancelled = true
     }
-  }, [presetWindow, isCustom, rangeOpen])
+  }, [presetWindow, isCustom, rangeOpen, refreshSignal, refreshTick])
 
   // 小时下钻:点击某小时柱后拉取该小时 60 分钟分布;取消选中时清空
   useEffect(() => {
@@ -3058,7 +3071,7 @@ function UsageCard({
     return () => {
       cancelled = true
     }
-  }, [drillHour])
+  }, [drillHour, refreshSignal, refreshTick])
 
   const loadCustomRange = (startMs: number, endMs: number): void => {
     setRangeLoading(true)

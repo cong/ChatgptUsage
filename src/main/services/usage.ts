@@ -22,7 +22,7 @@ import { AGENT_PROVIDERS, listClaudeFiles, parseClaudeFile, type UsageEvent } fr
 import { computeCost, normalizeModel } from './rate.ts'
 
 // 展示窗口最大天数;buildSeries 按此取日期序列,事件层过滤由日期序列完成(对齐 cc-switch 查询层过滤)
-const CACHE_TTL_MS = 60_000
+const CACHE_TTL_MS = 30_000
 // 增量缓存兜底:距上次全量重扫超过该时长强制全量对账,消除 mtime 不可靠导致的累计偏差
 const FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000
 
