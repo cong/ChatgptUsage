@@ -208,7 +208,7 @@ const COPY = {
     usageMinuteHourHint: '点击柱状图下钻到分钟',
     quotaHourly: '5小时额度 · 每小时已用',
     quotaMinute: '每分钟已用',
-    quotaSampleHint: '每小时取末次采样；点击查看分钟，历史从启用后开始',
+    quotaSampleHint: '柱高按当前最大值缩放；悬浮查看实际比例，点击查看分钟',
     quotaUsedPercent: '已使用',
     modelUsage: '模型用量',
     modelOther: '其他',
@@ -343,7 +343,8 @@ const COPY = {
     usageMinuteHourHint: 'Click a bar to drill into minutes',
     quotaHourly: '5h quota · hourly used',
     quotaMinute: 'Minute-by-minute used',
-    quotaSampleHint: 'Latest sample each hour; click for minutes. History starts when enabled',
+    quotaSampleHint:
+      'Bars scale to the current maximum; hover for the actual percentage, click for minutes',
     quotaUsedPercent: 'Used',
     modelUsage: 'Model usage',
     modelOther: 'Other',
@@ -2995,6 +2996,7 @@ function UsageCard({
   const todayQuotaSamples = normalizeQuotaSamples(quotaUsageSamples)
   const quotaHours: Array<QuotaUsageSample | undefined> = Array(24).fill(undefined)
   for (const sample of todayQuotaSamples) quotaHours[new Date(sample.atMs).getHours()] = sample
+  const quotaHourlyMax = Math.max(1, ...quotaHours.map((sample) => sample?.usedPercent ?? 0))
   const quotaMinutes: Array<QuotaUsageSample | undefined> = Array(60).fill(undefined)
   if (quotaDrillHour !== undefined) {
     for (const sample of todayQuotaSamples) {
@@ -3002,6 +3004,7 @@ function UsageCard({
       if (date.getHours() === quotaDrillHour) quotaMinutes[date.getMinutes()] = sample
     }
   }
+  const quotaMinuteMax = Math.max(1, ...quotaMinutes.map((sample) => sample?.usedPercent ?? 0))
 
   useEffect(() => {
     let cancelled = false
@@ -3393,7 +3396,7 @@ function UsageCard({
                 </div>
               ) : null}
               {authMode === 'chatgpt' && quotaHours.some(Boolean) ? (
-                <div className="usage-quota-history">
+                <div className="usage-hourly">
                   <span className="usage-hourly__title">{copy.quotaHourly}</span>
                   <div className="usage-chart" onMouseLeave={() => setQuotaHoveredHour(undefined)}>
                     {quotaHoveredHour !== undefined && quotaHours[quotaHoveredHour] ? (
@@ -3405,38 +3408,39 @@ function UsageCard({
                         sample={quotaHours[quotaHoveredHour]}
                       />
                     ) : null}
-                    {quotaHours.map((sample, hour) => (
-                      <button
-                        aria-label={`${formatHourLabel(hour)} ${sample ? `${copy.quotaUsedPercent} ${Math.round(sample.usedPercent)}%` : copy.noData}`}
-                        className={`usage-chart__col usage-chart__col--quota${quotaDrillHour === hour ? ' is-active' : ''}`}
-                        disabled={!sample}
-                        key={hour}
-                        onClick={() =>
-                          setQuotaDrillHour(quotaDrillHour === hour ? undefined : hour)
-                        }
-                        onMouseEnter={() => setQuotaHoveredHour(hour)}
-                        type="button"
-                      >
-                        <span className="usage-chart__bar-wrap">
-                          <span
-                            className="usage-chart__bar usage-chart__bar--stack"
-                            style={{
-                              height: `${sample?.usedPercent ? Math.max(6, sample.usedPercent) : 2}%`
-                            }}
-                          >
-                            <span
-                              className="usage-chart__bar-seg is-input"
-                              style={{ height: sample?.usedPercent ? '100%' : '0%' }}
-                            />
-                          </span>
-                        </span>
-                        <span
-                          className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
+                    {quotaHours.map((sample, hour) => {
+                      const value = sample?.usedPercent ?? 0
+                      const percent = value > 0 ? Math.max(6, (value / quotaHourlyMax) * 100) : 2
+                      const isActive = quotaDrillHour === hour
+                      return (
+                        <div
+                          aria-label={`${formatHourLabel(hour)} ${sample ? `${copy.quotaUsedPercent} ${Math.round(value)}%` : copy.noData}`}
+                          className={`usage-chart__col${isActive ? ' is-active' : ''}`}
+                          key={hour}
+                          onClick={() =>
+                            sample ? setQuotaDrillHour(isActive ? undefined : hour) : undefined
+                          }
+                          onMouseEnter={() => setQuotaHoveredHour(hour)}
                         >
-                          {formatHourLabel(hour)}
-                        </span>
-                      </button>
-                    ))}
+                          <span className="usage-chart__bar-wrap">
+                            <span
+                              className="usage-chart__bar usage-chart__bar--stack"
+                              style={{ height: `${percent}%` }}
+                            >
+                              <span
+                                className="usage-chart__bar-seg is-input"
+                                style={{ height: value > 0 ? '100%' : '0%' }}
+                              />
+                            </span>
+                          </span>
+                          <span
+                            className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
+                          >
+                            {formatHourLabel(hour)}
+                          </span>
+                        </div>
+                      )
+                    })}
                   </div>
                   {quotaDrillHour !== undefined && quotaMinutes.some(Boolean) ? (
                     <div className="usage-minute">
@@ -3456,32 +3460,37 @@ function UsageCard({
                             sample={quotaMinutes[quotaHoveredMinute]}
                           />
                         ) : null}
-                        {quotaMinutes.map((sample, minute) => (
-                          <div
-                            className="usage-chart__col"
-                            key={minute}
-                            onMouseEnter={() => setQuotaHoveredMinute(sample ? minute : undefined)}
-                          >
-                            <span className="usage-chart__bar-wrap">
-                              <span
-                                className="usage-chart__bar usage-chart__bar--stack"
-                                style={{
-                                  height: `${sample?.usedPercent ? Math.max(3, sample.usedPercent) : 2}%`
-                                }}
-                              >
-                                <span
-                                  className="usage-chart__bar-seg is-input"
-                                  style={{ height: sample?.usedPercent ? '100%' : '0%' }}
-                                />
-                              </span>
-                            </span>
-                            <span
-                              className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
+                        {quotaMinutes.map((sample, minute) => {
+                          const value = sample?.usedPercent ?? 0
+                          const percent =
+                            value > 0 ? Math.max(3, (value / quotaMinuteMax) * 100) : 2
+                          return (
+                            <div
+                              className="usage-chart__col"
+                              key={minute}
+                              onMouseEnter={() =>
+                                setQuotaHoveredMinute(sample ? minute : undefined)
+                              }
                             >
-                              {formatMinuteLabel(quotaDrillHour, minute)}
-                            </span>
-                          </div>
-                        ))}
+                              <span className="usage-chart__bar-wrap">
+                                <span
+                                  className="usage-chart__bar usage-chart__bar--stack"
+                                  style={{ height: `${percent}%` }}
+                                >
+                                  <span
+                                    className="usage-chart__bar-seg is-input"
+                                    style={{ height: value > 0 ? '100%' : '0%' }}
+                                  />
+                                </span>
+                              </span>
+                              <span
+                                className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
+                              >
+                                {formatMinuteLabel(quotaDrillHour, minute)}
+                              </span>
+                            </div>
+                          )
+                        })}
                       </div>
                     </div>
                   ) : null}
