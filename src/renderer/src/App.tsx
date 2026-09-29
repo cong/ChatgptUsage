@@ -208,7 +208,7 @@ const COPY = {
     usageMinuteHourHint: '点击柱状图下钻到分钟',
     quotaHourly: '5小时额度 · 每小时已用',
     quotaMinute: '每分钟已用',
-    quotaSampleHint: '柱高按当前最大值缩放；悬浮查看实际比例，点击查看分钟',
+    quotaSampleHint: '柱高按实际已用百分比显示；悬浮查看数值，点击查看分钟',
     quotaUsedPercent: '已使用',
     modelUsage: '模型用量',
     modelOther: '其他',
@@ -344,7 +344,7 @@ const COPY = {
     quotaHourly: '5h quota · hourly used',
     quotaMinute: 'Minute-by-minute used',
     quotaSampleHint:
-      'Bars scale to the current maximum; hover for the actual percentage, click for minutes',
+      'Bar height shows the actual used percentage; hover for the value, click for minutes',
     quotaUsedPercent: 'Used',
     modelUsage: 'Model usage',
     modelOther: 'Other',
@@ -2996,7 +2996,6 @@ function UsageCard({
   const todayQuotaSamples = normalizeQuotaSamples(quotaUsageSamples)
   const quotaHours: Array<QuotaUsageSample | undefined> = Array(24).fill(undefined)
   for (const sample of todayQuotaSamples) quotaHours[new Date(sample.atMs).getHours()] = sample
-  const quotaHourlyMax = Math.max(1, ...quotaHours.map((sample) => sample?.usedPercent ?? 0))
   const quotaMinutes: Array<QuotaUsageSample | undefined> = Array(60).fill(undefined)
   if (quotaDrillHour !== undefined) {
     for (const sample of todayQuotaSamples) {
@@ -3004,7 +3003,6 @@ function UsageCard({
       if (date.getHours() === quotaDrillHour) quotaMinutes[date.getMinutes()] = sample
     }
   }
-  const quotaMinuteMax = Math.max(1, ...quotaMinutes.map((sample) => sample?.usedPercent ?? 0))
 
   useEffect(() => {
     let cancelled = false
@@ -3410,7 +3408,6 @@ function UsageCard({
                     ) : null}
                     {quotaHours.map((sample, hour) => {
                       const value = sample?.usedPercent ?? 0
-                      const percent = value > 0 ? Math.max(6, (value / quotaHourlyMax) * 100) : 2
                       const isActive = quotaDrillHour === hour
                       return (
                         <div
@@ -3425,11 +3422,11 @@ function UsageCard({
                           <span className="usage-chart__bar-wrap">
                             <span
                               className="usage-chart__bar usage-chart__bar--stack"
-                              style={{ height: `${percent}%` }}
+                              style={{ height: `${sample ? value : 2}%` }}
                             >
                               <span
                                 className="usage-chart__bar-seg is-input"
-                                style={{ height: value > 0 ? '100%' : '0%' }}
+                                style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
                               />
                             </span>
                           </span>
@@ -3462,8 +3459,6 @@ function UsageCard({
                         ) : null}
                         {quotaMinutes.map((sample, minute) => {
                           const value = sample?.usedPercent ?? 0
-                          const percent =
-                            value > 0 ? Math.max(3, (value / quotaMinuteMax) * 100) : 2
                           return (
                             <div
                               className="usage-chart__col"
@@ -3475,11 +3470,11 @@ function UsageCard({
                               <span className="usage-chart__bar-wrap">
                                 <span
                                   className="usage-chart__bar usage-chart__bar--stack"
-                                  style={{ height: `${percent}%` }}
+                                  style={{ height: `${sample ? value : 2}%` }}
                                 >
                                   <span
                                     className="usage-chart__bar-seg is-input"
-                                    style={{ height: value > 0 ? '100%' : '0%' }}
+                                    style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
                                   />
                                 </span>
                               </span>
