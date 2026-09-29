@@ -2572,6 +2572,26 @@ body {
   margin-top: 12px;
 }
 
+.usage-quota-history {
+  margin-top: 14px;
+}
+
+.usage-chart__col--quota {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font: inherit;
+}
+
+.usage-chart__col--quota:disabled {
+  cursor: default;
+}
+
+.usage-chart__col--quota:focus-visible .usage-chart__bar {
+  outline: 2px solid var(--panel-text);
+  outline-offset: 2px;
+}
+
 /* 选中的小时柱:可点击且有高亮描边 */
 .usage-chart__col.is-active {
   cursor: pointer;

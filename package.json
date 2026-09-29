@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-usage",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "ChatgptUsage - ChatGPT用量显示",
   "main": "./out/main/index.js",
   "author": "cong",
@@ -9,7 +9,7 @@
     "format": "prettier --write .",
     "lint": "eslint --cache .",
     "test": "npm run test:unit && npm run test:panel-open && npm run test:cockpit && npm run test:island",
-    "test:unit": "node --experimental-strip-types --test scripts/announcement.test.mjs scripts/codex-hook-ingress.test.mjs scripts/codex-hook-installer.test.mjs scripts/codex-ipc-client.test.mjs scripts/codex-thread-catalog.test.mjs scripts/island-state.test.mjs scripts/quota-recheck.test.mjs scripts/usage-align.test.mjs scripts/window-keeper.test.mjs scripts/windows-fullscreen.test.mjs",
+    "test:unit": "node --experimental-strip-types --test scripts/announcement.test.mjs scripts/codex-hook-ingress.test.mjs scripts/codex-hook-installer.test.mjs scripts/codex-ipc-client.test.mjs scripts/codex-thread-catalog.test.mjs scripts/island-state.test.mjs scripts/quota-history.test.mjs scripts/quota-recheck.test.mjs scripts/usage-align.test.mjs scripts/window-keeper.test.mjs scripts/windows-fullscreen.test.mjs",
     "test:quota": "node --experimental-strip-types --test scripts/quota-recheck.test.mjs",
     "test:panel-open": "node --test scripts/panel-open-flicker.test.mjs",
     "test:cockpit": "electron scripts/cockpit-animation.test.mjs",

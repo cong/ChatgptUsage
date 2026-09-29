@@ -12,6 +12,7 @@ import {
   type Rectangle
 } from 'electron'
 import { randomUUID } from 'node:crypto'
+import { appendQuotaSample } from '../shared/quota-history'
 import { watchFile, unwatchFile } from 'node:fs'
 import { join } from 'path'
 import { electronApp, optimizer, is } from '@electron-toolkit/utils'
@@ -394,7 +395,10 @@ if (hasSingleInstanceLock) {
       persistedState.peerId = randomUUID()
       queuePersistState()
     }
-    currentSnapshot = createEmptySnapshot()
+    currentSnapshot = {
+      ...createEmptySnapshot(),
+      quotaUsageSamples: persistedState.quotaUsageSamples
+    }
     windowKeeper = new WindowKeeper({
       enabled: persistedState.settings.autoKeep5hWindow,
       persisted: persistedState.windowKeeper,
@@ -1288,11 +1292,25 @@ async function refreshStatus(options: { forceCredentialCheck?: boolean } = {}): 
               bestModelPick: currentSnapshot.bestModelPick
             })
           : createApiModeSnapshot()
+      if (collected.rateLimitSource === 'official' && collected.authMode === 'chatgpt') {
+        const fiveHour = collected.rateLimits.find((item) => item.windowMinutes === 300)
+        if (fiveHour?.usedPercent !== undefined) {
+          persistedState = {
+            ...persistedState,
+            quotaUsageSamples: appendQuotaSample(persistedState.quotaUsageSamples, {
+              atMs: Date.now(),
+              usedPercent: fiveHour.usedPercent
+            })
+          }
+          queuePersistState()
+        }
+      }
       // 预热三窗口 token 汇总,供本机排行榜与 LAN 广播同步读取
       await warmAllAgentTokenTotals()
       // collect 期间 radar 回调可能已更新 bestModelPick;优先取最新值,旧值仅作兜底
       setCurrentSnapshot({
         ...collected,
+        quotaUsageSamples: persistedState.quotaUsageSamples,
         // 非 Codex 不保留雷达推荐(切换工具时避免旧 Codex 推荐残留)
         bestModelPick:
           agentId === 'codex'

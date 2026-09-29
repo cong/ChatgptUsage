@@ -38,6 +38,7 @@ import {
   type WindowPreferences
 } from '../../shared/capsule'
 import { formatAnnouncementTime, resolveCapsuleAlert } from '../../shared/announcement'
+import { normalizeQuotaSamples, type QuotaUsageSample } from '../../shared/quota-history'
 import { createEmptyIslandSnapshot, type IslandSnapshot } from '../../shared/island'
 import { IslandSettingsCard } from './island/IslandSettingsCard'
 
@@ -205,6 +206,10 @@ const COPY = {
     usageHourlyToday: '今日小时分布',
     usageMinuteRange: '分钟分布',
     usageMinuteHourHint: '点击柱状图下钻到分钟',
+    quotaHourly: '5小时额度 · 每小时已用',
+    quotaMinute: '每分钟已用',
+    quotaSampleHint: '每小时取末次采样；点击查看分钟，历史从启用后开始',
+    quotaUsedPercent: '已使用',
     modelUsage: '模型用量',
     modelOther: '其他',
     rangeCustom: '自定义',
@@ -336,6 +341,10 @@ const COPY = {
     usageHourlyToday: 'Today (hourly)',
     usageMinuteRange: 'Minute breakdown',
     usageMinuteHourHint: 'Click a bar to drill into minutes',
+    quotaHourly: '5h quota · hourly used',
+    quotaMinute: 'Minute-by-minute used',
+    quotaSampleHint: 'Latest sample each hour; click for minutes. History starts when enabled',
+    quotaUsedPercent: 'Used',
     modelUsage: 'Model usage',
     modelOther: 'Other',
     rangeCustom: 'Custom',
@@ -2025,6 +2034,7 @@ function App(): React.JSX.Element {
                 key={settings.agentId}
                 authMode={snapshot.authMode}
                 locale={settings.locale}
+                quotaUsageSamples={snapshot.quotaUsageSamples}
                 refreshSignal={`${snapshot.generatedAt ?? ''}:${panelRevealRequest}`}
               />
 
@@ -2918,10 +2928,12 @@ function ModelLeaderboard({
 function UsageCard({
   locale,
   authMode,
+  quotaUsageSamples,
   refreshSignal
 }: {
   locale: LocaleCode
   authMode: AuthMode
+  quotaUsageSamples?: QuotaUsageSample[]
   refreshSignal: string
 }): React.JSX.Element {
   const copy = COPY[locale]
@@ -2977,6 +2989,19 @@ function UsageCard({
   const [drillHour, setDrillHour] = useState<number | undefined>(undefined)
   const [minuteData, setMinuteData] = useState<TokenUsageMinute[] | undefined>(undefined)
   const [minuteHoveredIndex, setMinuteHoveredIndex] = useState<number | undefined>(undefined)
+  const [quotaDrillHour, setQuotaDrillHour] = useState<number | undefined>(undefined)
+  const [quotaHoveredHour, setQuotaHoveredHour] = useState<number | undefined>(undefined)
+  const [quotaHoveredMinute, setQuotaHoveredMinute] = useState<number | undefined>(undefined)
+  const todayQuotaSamples = normalizeQuotaSamples(quotaUsageSamples)
+  const quotaHours: Array<QuotaUsageSample | undefined> = Array(24).fill(undefined)
+  for (const sample of todayQuotaSamples) quotaHours[new Date(sample.atMs).getHours()] = sample
+  const quotaMinutes: Array<QuotaUsageSample | undefined> = Array(60).fill(undefined)
+  if (quotaDrillHour !== undefined) {
+    for (const sample of todayQuotaSamples) {
+      const date = new Date(sample.atMs)
+      if (date.getHours() === quotaDrillHour) quotaMinutes[date.getMinutes()] = sample
+    }
+  }
 
   useEffect(() => {
     let cancelled = false
@@ -3092,7 +3117,10 @@ function UsageCard({
   const isLoading = usage === undefined
   const days = usage?.days ?? []
   const totals = usage?.totals
-  const hasData = usage?.available === true && totals !== undefined
+  // 即使本机今天没有 token 记录，也展示已采集的账号级 5 小时额度曲线。
+  const hasData =
+    totals !== undefined &&
+    (usage?.available === true || (presetWindow === '1d' && quotaHours.some(Boolean)))
   const chartMax = Math.max(
     1,
     days.reduce((max, day) => Math.max(max, day.input + day.output), 0)
@@ -3364,6 +3392,98 @@ function UsageCard({
                   ) : null}
                 </div>
               ) : null}
+              {authMode === 'chatgpt' && quotaHours.some(Boolean) ? (
+                <div className="usage-quota-history">
+                  <span className="usage-hourly__title">{copy.quotaHourly}</span>
+                  <div className="usage-chart" onMouseLeave={() => setQuotaHoveredHour(undefined)}>
+                    {quotaHoveredHour !== undefined && quotaHours[quotaHoveredHour] ? (
+                      <QuotaSampleTooltip
+                        locale={locale}
+                        index={quotaHoveredHour}
+                        count={24}
+                        label={formatHourLabel(quotaHoveredHour)}
+                        sample={quotaHours[quotaHoveredHour]}
+                      />
+                    ) : null}
+                    {quotaHours.map((sample, hour) => (
+                      <button
+                        aria-label={`${formatHourLabel(hour)} ${sample ? `${copy.quotaUsedPercent} ${Math.round(sample.usedPercent)}%` : copy.noData}`}
+                        className={`usage-chart__col usage-chart__col--quota${quotaDrillHour === hour ? ' is-active' : ''}`}
+                        disabled={!sample}
+                        key={hour}
+                        onClick={() =>
+                          setQuotaDrillHour(quotaDrillHour === hour ? undefined : hour)
+                        }
+                        onMouseEnter={() => setQuotaHoveredHour(hour)}
+                        type="button"
+                      >
+                        <span className="usage-chart__bar-wrap">
+                          {sample ? (
+                            <span
+                              className="usage-chart__bar"
+                              style={{
+                                height: `${Math.max(3, sample.usedPercent)}%`,
+                                background: 'var(--panel-icon-green)'
+                              }}
+                            />
+                          ) : null}
+                        </span>
+                        <span
+                          className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
+                        >
+                          {formatHourLabel(hour)}
+                        </span>
+                      </button>
+                    ))}
+                  </div>
+                  {quotaDrillHour !== undefined && quotaMinutes.some(Boolean) ? (
+                    <div className="usage-minute">
+                      <span className="usage-hourly__title">
+                        {formatHourLabel(quotaDrillHour)} · {copy.quotaMinute}
+                      </span>
+                      <div
+                        className="usage-chart"
+                        onMouseLeave={() => setQuotaHoveredMinute(undefined)}
+                      >
+                        {quotaHoveredMinute !== undefined && quotaMinutes[quotaHoveredMinute] ? (
+                          <QuotaSampleTooltip
+                            locale={locale}
+                            index={quotaHoveredMinute}
+                            count={60}
+                            label={formatMinuteLabel(quotaDrillHour, quotaHoveredMinute)}
+                            sample={quotaMinutes[quotaHoveredMinute]}
+                          />
+                        ) : null}
+                        {quotaMinutes.map((sample, minute) => (
+                          <div
+                            className="usage-chart__col"
+                            key={minute}
+                            onMouseEnter={() => setQuotaHoveredMinute(sample ? minute : undefined)}
+                          >
+                            <span className="usage-chart__bar-wrap">
+                              {sample ? (
+                                <span
+                                  className="usage-chart__bar"
+                                  style={{
+                                    height: `${Math.max(3, sample.usedPercent)}%`,
+                                    background: 'var(--panel-icon-green)'
+                                  }}
+                                />
+                              ) : null}
+                            </span>
+                            <span
+                              className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
+                            >
+                              {formatMinuteLabel(quotaDrillHour, minute)}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ) : null}
+                  <span className="usage-hourly__hint">{copy.quotaSampleHint}</span>
+                </div>
+              ) : null}
             </>
           ) : (
             <div className="usage-chart" onMouseLeave={() => setHoveredIndex(undefined)}>
@@ -3576,6 +3696,35 @@ function UsageTooltip({
       <div className="usage-tooltip__row usage-tooltip__cost">
         <span>{copy.usageCost}</span>
         <span>{costText}</span>
+      </div>
+    </div>
+  )
+}
+
+function QuotaSampleTooltip({
+  locale,
+  index,
+  count,
+  label,
+  sample
+}: {
+  locale: LocaleCode
+  index: number
+  count: number
+  label: string
+  sample: QuotaUsageSample
+}): React.JSX.Element {
+  const left = Math.max(15, Math.min(85, ((index + 0.5) / count) * 100))
+  const sampledAt = new Date(sample.atMs)
+  const minute = String(sampledAt.getMinutes()).padStart(2, '0')
+  return (
+    <div className="usage-tooltip" style={{ left: `${left}%` }}>
+      <div className="usage-tooltip__date">
+        {label} · {String(sampledAt.getHours()).padStart(2, '0')}:{minute}
+      </div>
+      <div className="usage-tooltip__row">
+        <span>{COPY[locale].quotaUsedPercent}</span>
+        <span>{sample.usedPercent.toFixed(1)}%</span>
       </div>
     </div>
   )

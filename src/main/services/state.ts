@@ -1,6 +1,7 @@
 import { app } from 'electron'
 import { promises as fs } from 'node:fs'
 import path from 'node:path'
+import { normalizeQuotaSamples } from '../../shared/quota-history'
 import {
   DEFAULT_SETTINGS,
   DEFAULT_PANEL_PREFERENCES,
@@ -35,6 +36,7 @@ export async function loadPersistedState(): Promise<PersistedState> {
       panel: normalizePanelPreferences(
         getRecord(parsed?.panel) as Partial<PanelPreferences> | undefined
       ),
+      quotaUsageSamples: normalizeQuotaSamples(parsed?.quotaUsageSamples),
       windowKeeper: normalizeWindowKeeperState(getRecord(parsed?.windowKeeper)),
       islandViewedEventIds: normalizeEventIds(parsed?.islandViewedEventIds)
     }
@@ -61,6 +63,7 @@ async function tryMigrateLegacyState(): Promise<PersistedState | undefined> {
       panel: normalizePanelPreferences(
         getRecord(parsed?.panel) as Partial<PanelPreferences> | undefined
       ),
+      quotaUsageSamples: normalizeQuotaSamples(parsed?.quotaUsageSamples),
       windowKeeper: normalizeWindowKeeperState(getRecord(parsed?.windowKeeper)),
       islandViewedEventIds: normalizeEventIds(parsed?.islandViewedEventIds)
     }

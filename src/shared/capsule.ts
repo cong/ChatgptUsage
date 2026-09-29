@@ -5,6 +5,7 @@ import {
   type IslandPreferences,
   type IslandSnapshot
 } from './island'
+import type { QuotaUsageSample } from './quota-history'
 
 export type PercentageMode = 'remaining' | 'used'
 export type RefreshMode = 'auto' | 'manual'
@@ -73,6 +74,8 @@ export interface UsageSnapshot {
   authMode: AuthMode
   generatedAt?: string
   rateLimits: RateLimitWindowSnapshot[]
+  /** 今天已采集的官方 5 小时额度已用比例；每分钟保留最新值 */
+  quotaUsageSamples?: QuotaUsageSample[]
   rateLimitSource: RateLimitSource
   sourceHost: string
   issues: string[]
@@ -333,6 +336,7 @@ export interface PersistedState {
   settings: AppSettings
   window: WindowPreferences
   panel: PanelPreferences
+  quotaUsageSamples?: QuotaUsageSample[]
   windowKeeper?: WindowKeeperPersistedState
   /** 本机 LAN 标识,跨重启稳定;首次启动生成 UUID */
   peerId?: string
