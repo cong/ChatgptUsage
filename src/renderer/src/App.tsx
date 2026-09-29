@@ -3418,15 +3418,17 @@ function UsageCard({
                         type="button"
                       >
                         <span className="usage-chart__bar-wrap">
-                          {sample ? (
+                          <span
+                            className="usage-chart__bar usage-chart__bar--stack"
+                            style={{
+                              height: `${sample?.usedPercent ? Math.max(6, sample.usedPercent) : 2}%`
+                            }}
+                          >
                             <span
-                              className="usage-chart__bar"
-                              style={{
-                                height: `${Math.max(3, sample.usedPercent)}%`,
-                                background: 'var(--panel-icon-green)'
-                              }}
+                              className="usage-chart__bar-seg is-input"
+                              style={{ height: sample?.usedPercent ? '100%' : '0%' }}
                             />
-                          ) : null}
+                          </span>
                         </span>
                         <span
                           className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
@@ -3461,15 +3463,17 @@ function UsageCard({
                             onMouseEnter={() => setQuotaHoveredMinute(sample ? minute : undefined)}
                           >
                             <span className="usage-chart__bar-wrap">
-                              {sample ? (
+                              <span
+                                className="usage-chart__bar usage-chart__bar--stack"
+                                style={{
+                                  height: `${sample?.usedPercent ? Math.max(3, sample.usedPercent) : 2}%`
+                                }}
+                              >
                                 <span
-                                  className="usage-chart__bar"
-                                  style={{
-                                    height: `${Math.max(3, sample.usedPercent)}%`,
-                                    background: 'var(--panel-icon-green)'
-                                  }}
+                                  className="usage-chart__bar-seg is-input"
+                                  style={{ height: sample?.usedPercent ? '100%' : '0%' }}
                                 />
-                              ) : null}
+                              </span>
                             </span>
                             <span
                               className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
