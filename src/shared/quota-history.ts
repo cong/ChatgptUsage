@@ -3,15 +3,13 @@ export interface QuotaUsageSample {
   usedPercent: number
 }
 
-function localDayKey(atMs: number): string {
-  const date = new Date(atMs)
-  return `${date.getFullYear()}-${date.getMonth()}-${date.getDate()}`
-}
-
-/** 只保留今天每分钟最新的一次有效额度采样。 */
+/** 保留最近 7 个本地自然日，每分钟只取最新的一次额度采样。 */
 export function normalizeQuotaSamples(value: unknown, nowMs = Date.now()): QuotaUsageSample[] {
   if (!Array.isArray(value)) return []
-  const today = localDayKey(nowMs)
+  const firstDay = new Date(nowMs)
+  firstDay.setHours(0, 0, 0, 0)
+  firstDay.setDate(firstDay.getDate() - 6)
+  const oldestAtMs = firstDay.getTime()
   const byMinute = new Map<number, QuotaUsageSample>()
   for (const item of value) {
     if (!item || typeof item !== 'object') continue
@@ -20,7 +18,7 @@ export function normalizeQuotaSamples(value: unknown, nowMs = Date.now()): Quota
       typeof atMs !== 'number' ||
       !Number.isFinite(atMs) ||
       atMs > nowMs ||
-      localDayKey(atMs) !== today ||
+      atMs < oldestAtMs ||
       typeof usedPercent !== 'number' ||
       !Number.isFinite(usedPercent) ||
       usedPercent < 0 ||

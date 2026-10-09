@@ -2457,6 +2457,7 @@ body {
   font-size: 15px;
   font-weight: 640;
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .usage-summary__label {

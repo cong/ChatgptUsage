@@ -152,6 +152,7 @@ let islandWindow: BrowserWindow | null = null
 let panelRevealPending = false
 let tray: Tray | null = null
 let refreshTimer: NodeJS.Timeout | undefined
+let wakeRefreshTimer: NodeJS.Timeout | undefined
 let persistTimer: NodeJS.Timeout | undefined
 let refreshPromise: Promise<void> | undefined
 let watchedCodexAuthPath: string | undefined
@@ -480,13 +481,20 @@ if (hasSingleInstanceLock) {
       showWindow()
     })
 
-    // 系统从睡眠/锁屏恢复时，重新显示胶囊窗口（除非用户主动隐藏）
-    powerMonitor.on('resume', () => {
+    // 恢复后立即刷新，并在网络恢复稳定后再补一次自动采样。
+    const onSystemWake = (): void => {
       if (!userHidCapsule) showWindow()
-    })
-    powerMonitor.on('unlock-screen', () => {
-      if (!userHidCapsule) showWindow()
-    })
+      void refreshAfterSystemWake()
+      if (wakeRefreshTimer) clearTimeout(wakeRefreshTimer)
+      wakeRefreshTimer = setTimeout(() => {
+        wakeRefreshTimer = undefined
+        if (!isQuitting && persistedState.settings.refreshMode === 'auto') {
+          void refreshAfterSystemWake()
+        }
+      }, 5000)
+    }
+    powerMonitor.on('resume', onSystemWake)
+    powerMonitor.on('unlock-screen', onSystemWake)
 
     // 显示器配置变更（拔插显示器/RDP/分辨率变化）时，修正窗口位置防止掉出屏幕
     screen.on('display-metrics-changed', () => {
@@ -520,6 +528,10 @@ app.on('window-all-closed', () => {
 app.on('before-quit', () => {
   isQuitting = true
   clearRefreshTimer()
+  if (wakeRefreshTimer) {
+    clearTimeout(wakeRefreshTimer)
+    wakeRefreshTimer = undefined
+  }
   clearCodexAuthWatcher()
   stopRadarTimer()
   windowKeeper?.stop()
@@ -1104,6 +1116,12 @@ function syncRefreshTimer(): void {
   refreshTimer = setInterval(() => {
     void refreshStatus()
   }, persistedState.settings.refreshIntervalSeconds * 1000)
+}
+
+async function refreshAfterSystemWake(): Promise<void> {
+  // 睡眠前的请求可能仍在结束中；等它完成后重新请求，避免只复用旧结果。
+  await refreshPromise
+  if (!isQuitting) await refreshStatus({ forceCredentialCheck: true })
 }
 
 function clearRefreshTimer(): void {

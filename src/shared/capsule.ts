@@ -74,7 +74,7 @@ export interface UsageSnapshot {
   authMode: AuthMode
   generatedAt?: string
   rateLimits: RateLimitWindowSnapshot[]
-  /** 今天已采集的官方 5 小时额度已用比例；每分钟保留最新值 */
+  /** 最近 7 个自然日已采集的官方 5 小时额度已用比例；每分钟保留最新值 */
   quotaUsageSamples?: QuotaUsageSample[]
   rateLimitSource: RateLimitSource
   sourceHost: string

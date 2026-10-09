@@ -209,6 +209,8 @@ const COPY = {
     quotaHourly: '5小时额度 · 每小时已用',
     quotaMinute: '每分钟已用',
     quotaSampleHint: '柱高按实际已用百分比显示；悬浮查看数值，点击查看分钟',
+    quotaNoHistory: '这一天没有已保存的额度采样记录',
+    quotaDayHint: '点击日期柱查看当天的 5 小时额度记录',
     quotaUsedPercent: '已使用',
     modelUsage: '模型用量',
     modelOther: '其他',
@@ -345,6 +347,8 @@ const COPY = {
     quotaMinute: 'Minute-by-minute used',
     quotaSampleHint:
       'Bar height shows the actual used percentage; hover for the value, click for minutes',
+    quotaNoHistory: 'No saved quota samples for this day',
+    quotaDayHint: 'Click a day to view its 5h quota history',
     quotaUsedPercent: 'Used',
     modelUsage: 'Model usage',
     modelOther: 'Other',
@@ -2942,7 +2946,16 @@ function UsageCard({
   // 本地 session 用量不依赖额度刷新模式；详情页打开期间定时读取新记录。
   useEffect(() => {
     const timer = window.setInterval(() => setRefreshTick((tick) => tick + 1), 30_000)
-    return () => window.clearInterval(timer)
+    const refreshWhenVisible = (): void => {
+      if (document.visibilityState === 'visible') setRefreshTick((tick) => tick + 1)
+    }
+    window.addEventListener('focus', refreshWhenVisible)
+    document.addEventListener('visibilitychange', refreshWhenVisible)
+    return () => {
+      window.clearInterval(timer)
+      window.removeEventListener('focus', refreshWhenVisible)
+      document.removeEventListener('visibilitychange', refreshWhenVisible)
+    }
   }, [])
   // 三个窗口一并读取并在刷新时更新,切换按钮即时显示
   const [usageByWindow, setUsageByWindow] = useState<
@@ -2990,19 +3003,12 @@ function UsageCard({
   const [drillHour, setDrillHour] = useState<number | undefined>(undefined)
   const [minuteData, setMinuteData] = useState<TokenUsageMinute[] | undefined>(undefined)
   const [minuteHoveredIndex, setMinuteHoveredIndex] = useState<number | undefined>(undefined)
-  const [quotaDrillHour, setQuotaDrillHour] = useState<number | undefined>(undefined)
-  const [quotaHoveredHour, setQuotaHoveredHour] = useState<number | undefined>(undefined)
-  const [quotaHoveredMinute, setQuotaHoveredMinute] = useState<number | undefined>(undefined)
-  const todayQuotaSamples = normalizeQuotaSamples(quotaUsageSamples)
-  const quotaHours: Array<QuotaUsageSample | undefined> = Array(24).fill(undefined)
-  for (const sample of todayQuotaSamples) quotaHours[new Date(sample.atMs).getHours()] = sample
-  const quotaMinutes: Array<QuotaUsageSample | undefined> = Array(60).fill(undefined)
-  if (quotaDrillHour !== undefined) {
-    for (const sample of todayQuotaSamples) {
-      const date = new Date(sample.atMs)
-      if (date.getHours() === quotaDrillHour) quotaMinutes[date.getMinutes()] = sample
-    }
-  }
+  const [selectedQuotaDay, setSelectedQuotaDay] = useState<string | undefined>(undefined)
+  const retainedQuotaSamples = normalizeQuotaSamples(quotaUsageSamples)
+  const todayDate = toDateInput(Date.now())
+  const hasTodayQuotaSamples = retainedQuotaSamples.some(
+    (sample) => toDateInput(sample.atMs) === todayDate
+  )
 
   useEffect(() => {
     let cancelled = false
@@ -3121,7 +3127,10 @@ function UsageCard({
   // 即使本机今天没有 token 记录，也展示已采集的账号级 5 小时额度曲线。
   const hasData =
     totals !== undefined &&
-    (usage?.available === true || (presetWindow === '1d' && quotaHours.some(Boolean)))
+    (usage?.available === true ||
+      (authMode === 'chatgpt' &&
+        ((presetWindow === '1d' && hasTodayQuotaSamples) ||
+          (presetWindow === '7d' && retainedQuotaSamples.length > 0))))
   const chartMax = Math.max(
     1,
     days.reduce((max, day) => Math.max(max, day.input + day.output), 0)
@@ -3168,6 +3177,7 @@ function UsageCard({
               startWindowMotion()
             }
             setPresetWindow(usageWindow)
+            setSelectedQuotaDay(undefined)
             setCustomRange(undefined)
             setRangeOpen(false)
           }
@@ -3299,7 +3309,7 @@ function UsageCard({
                                 style={{ height: `${cachedPct}%` }}
                               />
                               <span
-                                className="usage-chart__bar-seg is-input"
+                                className="usage-chart__bar-seg is-cached"
                                 style={{ height: `${inputPct}%` }}
                               />
                               <span
@@ -3393,166 +3403,224 @@ function UsageCard({
                   ) : null}
                 </div>
               ) : null}
-              {authMode === 'chatgpt' && quotaHours.some(Boolean) ? (
-                <div className="usage-hourly">
-                  <span className="usage-hourly__title">{copy.quotaHourly}</span>
-                  <div className="usage-chart" onMouseLeave={() => setQuotaHoveredHour(undefined)}>
-                    {quotaHoveredHour !== undefined && quotaHours[quotaHoveredHour] ? (
-                      <QuotaSampleTooltip
-                        locale={locale}
-                        index={quotaHoveredHour}
-                        count={24}
-                        label={formatHourLabel(quotaHoveredHour)}
-                        sample={quotaHours[quotaHoveredHour]}
-                      />
-                    ) : null}
-                    {quotaHours.map((sample, hour) => {
-                      const value = sample?.usedPercent ?? 0
-                      const isActive = quotaDrillHour === hour
-                      return (
-                        <div
-                          aria-label={`${formatHourLabel(hour)} ${sample ? `${copy.quotaUsedPercent} ${Math.round(value)}%` : copy.noData}`}
-                          className={`usage-chart__col${isActive ? ' is-active' : ''}`}
-                          key={hour}
-                          onClick={() =>
-                            sample ? setQuotaDrillHour(isActive ? undefined : hour) : undefined
-                          }
-                          onMouseEnter={() => setQuotaHoveredHour(hour)}
-                        >
-                          <span className="usage-chart__bar-wrap">
-                            <span
-                              className="usage-chart__bar usage-chart__bar--stack"
-                              style={{ height: `${sample ? value : 2}%` }}
-                            >
-                              <span
-                                className="usage-chart__bar-seg is-input"
-                                style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
-                              />
-                            </span>
-                          </span>
-                          <span
-                            className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
-                          >
-                            {formatHourLabel(hour)}
-                          </span>
-                        </div>
-                      )
-                    })}
-                  </div>
-                  {quotaDrillHour !== undefined && quotaMinutes.some(Boolean) ? (
-                    <div className="usage-minute">
-                      <span className="usage-hourly__title">
-                        {formatHourLabel(quotaDrillHour)} · {copy.quotaMinute}
-                      </span>
-                      <div
-                        className="usage-chart"
-                        onMouseLeave={() => setQuotaHoveredMinute(undefined)}
-                      >
-                        {quotaHoveredMinute !== undefined && quotaMinutes[quotaHoveredMinute] ? (
-                          <QuotaSampleTooltip
-                            locale={locale}
-                            index={quotaHoveredMinute}
-                            count={60}
-                            label={formatMinuteLabel(quotaDrillHour, quotaHoveredMinute)}
-                            sample={quotaMinutes[quotaHoveredMinute]}
-                          />
-                        ) : null}
-                        {quotaMinutes.map((sample, minute) => {
-                          const value = sample?.usedPercent ?? 0
-                          return (
-                            <div
-                              className="usage-chart__col"
-                              key={minute}
-                              onMouseEnter={() =>
-                                setQuotaHoveredMinute(sample ? minute : undefined)
-                              }
-                            >
-                              <span className="usage-chart__bar-wrap">
-                                <span
-                                  className="usage-chart__bar usage-chart__bar--stack"
-                                  style={{ height: `${sample ? value : 2}%` }}
-                                >
-                                  <span
-                                    className="usage-chart__bar-seg is-input"
-                                    style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
-                                  />
-                                </span>
-                              </span>
-                              <span
-                                className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
-                              >
-                                {formatMinuteLabel(quotaDrillHour, minute)}
-                              </span>
-                            </div>
-                          )
-                        })}
-                      </div>
-                    </div>
-                  ) : null}
-                  <span className="usage-hourly__hint">{copy.quotaSampleHint}</span>
-                </div>
+              {authMode === 'chatgpt' && hasTodayQuotaSamples ? (
+                <QuotaHistoryChart
+                  date={todayDate}
+                  key={todayDate}
+                  locale={locale}
+                  samples={retainedQuotaSamples}
+                />
               ) : null}
             </>
           ) : (
-            <div className="usage-chart" onMouseLeave={() => setHoveredIndex(undefined)}>
-              {hoveredIndex !== undefined && days[hoveredIndex] ? (
-                <UsageTooltip
-                  day={days[hoveredIndex]}
-                  index={hoveredIndex}
-                  count={days.length}
-                  locale={locale}
-                  spendMap={spendMap}
-                />
-              ) : null}
-              {days.map((day, index) => {
-                const value = day.input + day.output
-                const percent = value > 0 ? Math.max(6, (value / chartMax) * 100) : 2
-                const total = Math.max(1, value)
-                const newInput = Math.max(0, day.input - day.cachedInput)
-                // 三段占比合计 100%,从下到上:缓存输入 / 新输入 / 输出
-                const cachedPct = (day.cachedInput / total) * 100
-                const inputPct = (newInput / total) * 100
-                const outputPct = (day.output / total) * 100
-                return (
-                  <div
-                    className="usage-chart__col"
-                    key={day.date}
-                    onMouseEnter={() => setHoveredIndex(index)}
-                  >
-                    <span className="usage-chart__bar-wrap">
-                      <span
-                        className="usage-chart__bar usage-chart__bar--stack"
-                        style={{ height: `${percent}%` }}
-                      >
-                        <span
-                          className="usage-chart__bar-seg is-cached"
-                          style={{ height: `${cachedPct}%` }}
-                        />
-                        <span
-                          className="usage-chart__bar-seg is-input"
-                          style={{ height: `${inputPct}%` }}
-                        />
-                        <span
-                          className="usage-chart__bar-seg is-output"
-                          style={{ height: `${outputPct}%` }}
-                        />
-                      </span>
-                    </span>
-                    <span
-                      className={`usage-chart__date${shouldShowDateLabel(days.length, index) ? '' : ' is-hidden'}`}
+            <>
+              <div className="usage-chart" onMouseLeave={() => setHoveredIndex(undefined)}>
+                {hoveredIndex !== undefined && days[hoveredIndex] ? (
+                  <UsageTooltip
+                    day={days[hoveredIndex]}
+                    index={hoveredIndex}
+                    count={days.length}
+                    locale={locale}
+                    spendMap={spendMap}
+                  />
+                ) : null}
+                {days.map((day, index) => {
+                  const value = day.input + day.output
+                  const percent = value > 0 ? Math.max(6, (value / chartMax) * 100) : 2
+                  const total = Math.max(1, value)
+                  const newInput = Math.max(0, day.input - day.cachedInput)
+                  // 三段占比合计 100%,从下到上:缓存输入 / 新输入 / 输出
+                  const cachedPct = (day.cachedInput / total) * 100
+                  const inputPct = (newInput / total) * 100
+                  const outputPct = (day.output / total) * 100
+                  return (
+                    <div
+                      className={`usage-chart__col${presetWindow === '7d' && selectedQuotaDay === day.date ? ' is-active' : ''}`}
+                      key={day.date}
+                      onClick={() =>
+                        presetWindow === '7d' && authMode === 'chatgpt'
+                          ? setSelectedQuotaDay(
+                              selectedQuotaDay === day.date ? undefined : day.date
+                            )
+                          : undefined
+                      }
+                      onMouseEnter={() => setHoveredIndex(index)}
                     >
-                      {formatDayLabel(day.date)}
-                    </span>
-                  </div>
+                      <span className="usage-chart__bar-wrap">
+                        <span
+                          className="usage-chart__bar usage-chart__bar--stack"
+                          style={{ height: `${percent}%` }}
+                        >
+                          <span
+                            className="usage-chart__bar-seg is-cached"
+                            style={{ height: `${cachedPct}%` }}
+                          />
+                          <span
+                            className="usage-chart__bar-seg is-input"
+                            style={{ height: `${inputPct}%` }}
+                          />
+                          <span
+                            className="usage-chart__bar-seg is-output"
+                            style={{ height: `${outputPct}%` }}
+                          />
+                        </span>
+                      </span>
+                      <span
+                        className={`usage-chart__date${shouldShowDateLabel(days.length, index) ? '' : ' is-hidden'}`}
+                      >
+                        {formatDayLabel(day.date)}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+              {presetWindow === '7d' && authMode === 'chatgpt' ? (
+                selectedQuotaDay ? (
+                  <QuotaHistoryChart
+                    date={selectedQuotaDay}
+                    key={selectedQuotaDay}
+                    locale={locale}
+                    samples={retainedQuotaSamples}
+                    showDate
+                  />
+                ) : (
+                  <span className="usage-hourly__hint">{copy.quotaDayHint}</span>
                 )
-              })}
-            </div>
+              ) : null}
+            </>
           )}
           {costIsReal ? <p className="usage-card__spend-hint">{copy.spendReal}</p> : null}
         </>
       )}
       {models && models.length > 0 ? <ModelLeaderboard models={models} locale={locale} /> : null}
     </section>
+  )
+}
+
+function QuotaHistoryChart({
+  date,
+  locale,
+  samples,
+  showDate = false
+}: {
+  date: string
+  locale: LocaleCode
+  samples: QuotaUsageSample[]
+  showDate?: boolean
+}): React.JSX.Element {
+  const copy = COPY[locale]
+  const [drillHour, setDrillHour] = useState<number | undefined>(undefined)
+  const [hoveredHour, setHoveredHour] = useState<number | undefined>(undefined)
+  const [hoveredMinute, setHoveredMinute] = useState<number | undefined>(undefined)
+  const daySamples = samples.filter((sample) => toDateInput(sample.atMs) === date)
+  const hours: Array<QuotaUsageSample | undefined> = Array(24).fill(undefined)
+  for (const sample of daySamples) hours[new Date(sample.atMs).getHours()] = sample
+  const minutes: Array<QuotaUsageSample | undefined> = Array(60).fill(undefined)
+  if (drillHour !== undefined) {
+    for (const sample of daySamples) {
+      const sampledAt = new Date(sample.atMs)
+      if (sampledAt.getHours() === drillHour) minutes[sampledAt.getMinutes()] = sample
+    }
+  }
+  const title = showDate ? `${date} · ${copy.quotaHourly}` : copy.quotaHourly
+
+  return (
+    <div className="usage-hourly">
+      <span className="usage-hourly__title">{title}</span>
+      {daySamples.length === 0 ? (
+        <p className="usage-hourly__hint">{copy.quotaNoHistory}</p>
+      ) : (
+        <>
+          <div className="usage-chart" onMouseLeave={() => setHoveredHour(undefined)}>
+            {hoveredHour !== undefined && hours[hoveredHour] ? (
+              <QuotaSampleTooltip
+                locale={locale}
+                index={hoveredHour}
+                count={24}
+                label={formatSampleTime(hours[hoveredHour].atMs)}
+                sample={hours[hoveredHour]}
+              />
+            ) : null}
+            {hours.map((sample, hour) => {
+              const value = sample?.usedPercent ?? 0
+              const isActive = drillHour === hour
+              return (
+                <div
+                  aria-label={`${formatHourLabel(hour)} ${sample ? `${copy.quotaUsedPercent} ${Math.round(value)}%` : copy.noData}`}
+                  className={`usage-chart__col${isActive ? ' is-active' : ''}`}
+                  key={hour}
+                  onClick={() => sample && setDrillHour(isActive ? undefined : hour)}
+                  onMouseEnter={() => setHoveredHour(hour)}
+                >
+                  <span className="usage-chart__bar-wrap">
+                    <span
+                      className="usage-chart__bar usage-chart__bar--stack"
+                      style={{ height: `${sample ? value : 2}%` }}
+                    >
+                      <span
+                        className="usage-chart__bar-seg is-cached"
+                        style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
+                      />
+                    </span>
+                  </span>
+                  <span
+                    className={`usage-chart__date${shouldShowHourLabel(hour) ? '' : ' is-hidden'}`}
+                  >
+                    {formatHourLabel(hour)}
+                  </span>
+                </div>
+              )
+            })}
+          </div>
+          {drillHour !== undefined && minutes.some(Boolean) ? (
+            <div className="usage-minute">
+              <span className="usage-hourly__title">
+                {formatHourLabel(drillHour)} · {copy.quotaMinute}
+              </span>
+              <div className="usage-chart" onMouseLeave={() => setHoveredMinute(undefined)}>
+                {hoveredMinute !== undefined && minutes[hoveredMinute] ? (
+                  <QuotaSampleTooltip
+                    locale={locale}
+                    index={hoveredMinute}
+                    count={60}
+                    label={formatMinuteLabel(drillHour, hoveredMinute)}
+                    sample={minutes[hoveredMinute]}
+                  />
+                ) : null}
+                {minutes.map((sample, minute) => {
+                  const value = sample?.usedPercent ?? 0
+                  return (
+                    <div
+                      className="usage-chart__col"
+                      key={minute}
+                      onMouseEnter={() => setHoveredMinute(sample ? minute : undefined)}
+                    >
+                      <span className="usage-chart__bar-wrap">
+                        <span
+                          className="usage-chart__bar usage-chart__bar--stack"
+                          style={{ height: `${sample ? value : 2}%` }}
+                        >
+                          <span
+                            className="usage-chart__bar-seg is-cached"
+                            style={{ flex: value > 0 ? '1 1 0' : '0 0 0' }}
+                          />
+                        </span>
+                      </span>
+                      <span
+                        className={`usage-chart__date${shouldShowMinuteLabel(minute) ? '' : ' is-hidden'}`}
+                      >
+                        {formatMinuteLabel(drillHour, minute)}
+                      </span>
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+          ) : null}
+          <span className="usage-hourly__hint">{copy.quotaSampleHint}</span>
+        </>
+      )}
+    </div>
   )
 }
 
@@ -3723,13 +3791,9 @@ function QuotaSampleTooltip({
   sample: QuotaUsageSample
 }): React.JSX.Element {
   const left = Math.max(15, Math.min(85, ((index + 0.5) / count) * 100))
-  const sampledAt = new Date(sample.atMs)
-  const minute = String(sampledAt.getMinutes()).padStart(2, '0')
   return (
     <div className="usage-tooltip" style={{ left: `${left}%` }}>
-      <div className="usage-tooltip__date">
-        {label} · {String(sampledAt.getHours()).padStart(2, '0')}:{minute}
-      </div>
+      <div className="usage-tooltip__date">{label}</div>
       <div className="usage-tooltip__row">
         <span>{COPY[locale].quotaUsedPercent}</span>
         <span>{sample.usedPercent.toFixed(1)}%</span>
@@ -3881,7 +3945,9 @@ function UsageSummaryItem({
 }): React.JSX.Element {
   return (
     <div className="usage-summary__item">
-      <span className={`usage-summary__value${tone ? `--${tone}` : ''}`}>{value}</span>
+      <span className={`usage-summary__value${tone ? ` usage-summary__value--${tone}` : ''}`}>
+        {value}
+      </span>
       <span className="usage-summary__label">{label}</span>
     </div>
   )
@@ -3916,6 +3982,11 @@ function shouldShowMinuteLabel(index: number): boolean {
 // 分钟下钻图浮层/标题时间格式:HH:MM(传入 hour + minute 两段,避免外部拼装)
 function formatMinuteLabel(hour: number, minute: number): string {
   return `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`
+}
+
+function formatSampleTime(atMs: number): string {
+  const sampledAt = new Date(atMs)
+  return formatMinuteLabel(sampledAt.getHours(), sampledAt.getMinutes())
 }
 
 // 紧凑数字:zh-CN 用 1.2万 / 3.4亿,其余用 1.2K / 3.4M / 1.1B
