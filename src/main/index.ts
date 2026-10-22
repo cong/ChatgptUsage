@@ -1,3 +1,4 @@
+import { configureUsageStorage } from './services/usage-storage'
 import {
   app,
   shell,
@@ -49,6 +50,7 @@ import {
   type RendererWindowRole,
   type ShowPanelOptions,
   type TeamPeer,
+  type UpdateProgress,
   type UsageSnapshot,
   type UsageWindow,
   type WindowPreferences
@@ -76,6 +78,7 @@ import { setRateLookup } from './services/rate'
 import { fetchModelsDevRates, getPricingRate } from './services/pricing'
 import { getSpendUsage } from './services/billing'
 import { loadPersistedState, savePersistedState } from './services/state'
+import { HiddenWindowRelease } from './services/hidden-window-release'
 import { LanService, type PeerSnapshot } from './services/lan'
 import {
   initAutoUpdater,
@@ -150,6 +153,7 @@ let mainWindow: BrowserWindow | null = null
 let panelWindow: BrowserWindow | null = null
 let islandWindow: BrowserWindow | null = null
 let panelRevealPending = false
+const panelWindowRelease = new HiddenWindowRelease()
 let tray: Tray | null = null
 let refreshTimer: NodeJS.Timeout | undefined
 let wakeRefreshTimer: NodeJS.Timeout | undefined
@@ -159,6 +163,7 @@ let watchedCodexAuthPath: string | undefined
 let isQuitting = false
 let userHidCapsule = false
 let currentPanelView: PanelView = 'details'
+let latestUpdateProgress: UpdateProgress | undefined
 // 胶囊版本角标跳转设置页时的一次性定位标志:由 bootstrap 或 command 消费后清除
 let panelFocusUpdate = false
 let panelFocusTarget: PanelFocusTarget | undefined
@@ -193,8 +198,7 @@ if (!hasSingleInstanceLock) {
 } else {
   app.on('second-instance', () => {
     if (panelWindow && !panelWindow.isDestroyed()) {
-      panelWindow.show()
-      panelWindow.focus()
+      openPanelWindow(currentPanelView)
       return
     }
 
@@ -329,7 +333,12 @@ function createPanelWindow(): BrowserWindow {
     window.webContents.setBackgroundThrottling(true)
   })
 
+  window.on('hide', () => panelWindowRelease.schedule(window))
+  window.on('show', () => panelWindowRelease.cancel())
+
   window.on('closed', () => {
+    if (panelWindow !== window) return
+    panelWindowRelease.cancel()
     panelRevealPending = false
     panelWindow = null
   })
@@ -385,6 +394,7 @@ function loadRenderer(window: BrowserWindow, role: RendererWindowRole): void {
 
 if (hasSingleInstanceLock) {
   app.whenReady().then(async () => {
+    configureUsageStorage(join(app.getPath('userData'), 'usage-cache'))
     const loadedState = await loadPersistedState()
     electronApp.setAppUserModelId('com.openai.codexstatus')
 
@@ -435,6 +445,10 @@ if (hasSingleInstanceLock) {
     registerIpcHandlers()
     // autoUpdater 初始化并注册进度转发:把更新事件推给渲染层
     setUpdaterProgressListener((payload) => {
+      latestUpdateProgress = {
+        ...payload,
+        version: payload.version ?? latestUpdateProgress?.version
+      }
       sendToRenderers(CHANNELS.updateProgress, payload)
     })
     initAutoUpdater()
@@ -527,6 +541,7 @@ app.on('window-all-closed', () => {
 
 app.on('before-quit', () => {
   isQuitting = true
+  panelWindowRelease.cancel()
   clearRefreshTimer()
   if (wakeRefreshTimer) {
     clearTimeout(wakeRefreshTimer)
@@ -548,24 +563,25 @@ function registerIpcHandlers(): void {
       settings: persistedState.settings,
       window: persistedState.window,
       panel: persistedState.panel,
-      snapshot: currentSnapshot,
+      snapshot: createRendererUsageSnapshot(role),
       role,
       panelView: currentPanelView,
       focusUpdate: role === 'panel' ? consumeFocusUpdate() : false,
       focusTarget: role === 'panel' ? consumeFocusTarget() : undefined,
       announcement: currentAnnouncement,
       island: createIslandRendererSnapshot(),
-      version: app.getVersion()
+      version: app.getVersion(),
+      updateProgress: role === 'panel' ? latestUpdateProgress : undefined
     }
   })
 
-  ipcMain.handle(CHANNELS.refresh, async () => {
+  ipcMain.handle(CHANNELS.refresh, async (event) => {
     if (!canRefreshStatus()) {
-      return currentSnapshot
+      return createRendererUsageSnapshot(resolveRendererRole(event.sender.id))
     }
 
     await refreshStatus()
-    return currentSnapshot
+    return createRendererUsageSnapshot(resolveRendererRole(event.sender.id))
   })
 
   ipcMain.handle(CHANNELS.updateSettings, async (_, patch: Partial<AppSettings>) => {
@@ -1069,6 +1085,7 @@ function openTeamFromTray(): void {
 
 function prepareToQuit(): void {
   isQuitting = true
+  panelWindowRelease.cancel()
   islandRendererReady = false
   islandPresentationVisible = false
   clearRefreshTimer()
@@ -1399,7 +1416,19 @@ function resolveCapsuleRuntimeBounds(): Rectangle {
 }
 
 function broadcastSnapshot(): void {
-  sendToRenderers(CHANNELS.snapshotUpdated, currentSnapshot)
+  const compact = createRendererUsageSnapshot('capsule')
+  for (const window of [mainWindow, islandWindow]) {
+    if (window && !window.isDestroyed()) {
+      window.webContents.send(CHANNELS.snapshotUpdated, compact)
+    }
+  }
+  if (panelWindow && !panelWindow.isDestroyed() && panelWindow.isVisible()) {
+    panelWindow.webContents.send(CHANNELS.snapshotUpdated, currentSnapshot)
+  }
+}
+
+function createRendererUsageSnapshot(role: RendererWindowRole): UsageSnapshot {
+  return role === 'panel' ? currentSnapshot : { ...currentSnapshot, quotaUsageSamples: undefined }
 }
 
 function setCurrentSnapshot(nextSnapshot: UsageSnapshot): void {
@@ -1686,6 +1715,7 @@ function normalizeShowPanelOptions(value: unknown): ShowPanelOptions {
 }
 
 function openPanelWindow(view: PanelView): void {
+  panelWindowRelease.cancel()
   currentPanelView = view
   if (!panelWindow || panelWindow.isDestroyed()) {
     // 新窗口页面未加载,command 收不到;focusUpdate 留给 bootstrap 消费
@@ -1703,6 +1733,8 @@ function openPanelWindow(view: PanelView): void {
     panelWindow.showInactive()
   }
 
+  // 隐藏期间不发送完整统计快照，重新打开时先补上最新数据。
+  panelWindow.webContents.send(CHANNELS.snapshotUpdated, currentSnapshot)
   panelWindow.webContents.send(CHANNELS.command, {
     type: 'show-panel-view',
     panelView: currentPanelView,

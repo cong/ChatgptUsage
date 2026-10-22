@@ -352,6 +352,8 @@ export interface BootstrapPayload {
   panelView: PanelView
   /** 应用版本号,设置页展示用 */
   version: string
+  /** 重建详情窗口时恢复当前更新下载状态。 */
+  updateProgress?: UpdateProgress
   /** 打开设置页后定位到检查更新区域(胶囊版本角标跳转用) */
   focusUpdate?: boolean
   /** 胶囊提醒点击后在目标 panel 内定位到具体区域 */

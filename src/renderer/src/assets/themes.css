@@ -9859,6 +9859,93 @@
   background: #6b6b70;
 }
 
+/* 额度用固定 0–100% 刻度。增加物理高度、移除吞掉低值的粗边，不抬高实际百分比。 */
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster']) .usage-chart--quota {
+  height: 132px;
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__col
+  .usage-chart__bar--quota {
+  border: none;
+  transform: none;
+  box-shadow: none;
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__col
+  .usage-chart__bar--quota.is-positive {
+  overflow: hidden;
+  box-shadow:
+    inset 1px 0 #101012,
+    inset -1px 0 #101012;
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__bar--quota::before {
+  left: 0;
+  right: 0;
+  top: 0;
+  bottom: auto;
+  height: 1px;
+  border: none;
+  background: var(--panel-accent);
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__bar--quota.is-zero {
+  overflow: visible;
+  background: transparent;
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__bar--quota.is-zero::before {
+  left: 25%;
+  right: 25%;
+  top: auto;
+  bottom: 0;
+  height: 1px;
+  background: var(--panel-muted);
+  opacity: 0.4;
+}
+
+:is([data-theme='swiss'], [data-theme='memphis'], [data-theme='poster'])
+  .usage-chart--quota
+  .usage-chart__bar--quota.is-missing {
+  visibility: hidden;
+}
+
+/* 在色段上方画社论的 0.2px 内描边，避免被子元素的实心填色遮住。 */
+[data-theme='swiss'] .usage-chart--quota .usage-chart__col .usage-chart__bar--quota.is-positive {
+  overflow: visible;
+}
+
+[data-theme='swiss'] .usage-chart--quota .usage-chart__bar--quota.is-positive::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border: none;
+  box-shadow:
+    inset 0.2px 0 #101012,
+    inset -0.2px 0 #101012,
+    inset 0 -0.2px #101012;
+  pointer-events: none;
+  z-index: 2;
+}
+
+[data-theme='swiss'] .usage-chart--quota .usage-chart__bar--quota.is-positive::before {
+  left: 0.2px;
+  right: 0.2px;
+  top: var(--quota-cap-shift, -0.75px);
+  height: 1.5px;
+  z-index: 3;
+}
+
 [data-theme='swiss'] .usage-chart__date {
   color: rgba(16, 16, 18, 0.6);
   font-family: 'Consolas', 'Courier New', 'Microsoft YaHei UI', monospace;

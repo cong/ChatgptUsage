@@ -1,8 +1,14 @@
+import { readJsonlIncrementally, skipNonUsageLine, type JsonlCursor } from './jsonl-cursor.ts'
 import { promises as fs } from 'node:fs'
 import type { Dirent } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import type { AuthMode, RateLimitSource, RateLimitWindowSnapshot, UsageSnapshot } from '../../shared/capsule'
+import type {
+  AuthMode,
+  RateLimitSource,
+  RateLimitWindowSnapshot,
+  UsageSnapshot
+} from '../../shared/capsule'
 
 interface RawRateLimit {
   windowMinutes?: number
@@ -20,6 +26,7 @@ interface RateLimitSnapshot {
 export interface JsonlFileEntry {
   filePath: string
   mtimeMs: number
+  size?: number
 }
 
 // 凭据判别式:chatgpt=订阅 OAuth,api=API Key,none=未识别/缺失
@@ -32,8 +39,7 @@ const SESSION_SUBDIR = 'sessions'
 // Codex 归档会话的独立目录(与 sessions 平级,不在其子目录内);不扫会丢 token
 const SESSION_ARCHIVE_SUBDIR = 'archived_sessions'
 const OFFICIAL_CODEX_USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage'
-const OFFICIAL_RESET_CREDITS_URL =
-  'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
+const OFFICIAL_RESET_CREDITS_URL = 'https://chatgpt.com/backend-api/wham/rate-limit-reset-credits'
 const OFFICIAL_QUOTA_TIMEOUT_MS = 8000
 const OFFICIAL_QUOTA_RECHECK_DELAY_MS = 1000
 const RESET_CREDIT_TIMEOUT_MS = 8000
@@ -50,10 +56,14 @@ interface ResetCreditCacheEntry {
   state: 'ok' | 'empty' | 'error'
 }
 
+let lastObservedRateLimits: UsageSnapshot['rateLimits'] = []
+
 let resetCreditCache: ResetCreditCacheEntry | undefined
 
 export function invalidateQuotaCaches(): void {
   resetCreditCache = undefined
+  lastObservedRateLimits = []
+  localQuotaFileCache.clear()
 }
 
 interface CollectOptions {
@@ -62,36 +72,14 @@ interface CollectOptions {
   bestModelPick?: UsageSnapshot['bestModelPick']
 }
 
-export async function collectUsageSnapshot(
-  options: CollectOptions = {}
-): Promise<UsageSnapshot> {
+export async function collectUsageSnapshot(options: CollectOptions = {}): Promise<UsageSnapshot> {
   const checkedPaths = resolveSessionPaths()
   const missingPaths: string[] = []
   const files: JsonlFileEntry[] = []
 
-  for (const candidate of checkedPaths) {
-    if (!(await pathExists(candidate))) {
-      missingPaths.push(candidate)
-      continue
-    }
-
-    files.push(...(await collectJsonlFiles(candidate, FILE_SCAN_LIMIT * 3)))
-  }
-
-  files.sort((left, right) => right.mtimeMs - left.mtimeMs)
-  const limitedFiles = files.slice(0, FILE_SCAN_LIMIT)
-  let latestLocalSnapshot: RateLimitSnapshot | undefined
-
-  for (const entry of limitedFiles) {
-    const snapshot = await readLatestRateLimitSnapshot(entry.filePath)
-    if (snapshot && (!latestLocalSnapshot || snapshot.timestamp > latestLocalSnapshot.timestamp)) {
-      latestLocalSnapshot = snapshot
-    }
-  }
-
-  const localRateLimits = toRateLimits(latestLocalSnapshot)
-  let rateLimits = localRateLimits
-  let rateLimitSource: RateLimitSource = hasRateLimits(localRateLimits) ? 'local' : 'none'
+  let limitedFiles: JsonlFileEntry[] = []
+  let rateLimits: UsageSnapshot['rateLimits'] = []
+  let rateLimitSource: RateLimitSource = 'none'
   let officialIssue: string | undefined
   let resetCredit: UsageSnapshot['resetCredit']
   const bestModelPick = options.bestModelPick
@@ -104,7 +92,7 @@ export async function collectUsageSnapshot(
       accessToken: credentialLookup.accessToken,
       accountId: credentialLookup.accountId
     })
-    const lookup = await fetchOfficialRateLimits(headers, localRateLimits)
+    const lookup = await fetchOfficialRateLimits(headers, lastObservedRateLimits)
     if (lookup.rateLimits !== undefined) {
       rateLimits = lookup.rateLimits
       rateLimitSource = 'official'
@@ -118,6 +106,31 @@ export async function collectUsageSnapshot(
   } else {
     officialIssue = credentialLookup.issue ?? '未找到 Codex 凭据'
   }
+
+  // 官方额度可用时完全跳过本地额度扫描。Token 统计使用独立的增量缓存。
+  if (rateLimitSource !== 'official') {
+    for (const candidate of checkedPaths) {
+      if (!(await pathExists(candidate))) {
+        missingPaths.push(candidate)
+        continue
+      }
+      files.push(...(await collectJsonlFiles(candidate, FILE_SCAN_LIMIT * 3)))
+    }
+    files.sort((left, right) => right.mtimeMs - left.mtimeMs)
+    limitedFiles = files.slice(0, FILE_SCAN_LIMIT)
+    const retainedPaths = new Set(limitedFiles.map((entry) => entry.filePath))
+    for (const filePath of localQuotaFileCache.keys())
+      if (!retainedPaths.has(filePath)) localQuotaFileCache.delete(filePath)
+    let latestLocalSnapshot: RateLimitSnapshot | undefined
+    for (const entry of limitedFiles) {
+      const snapshot = await readLatestRateLimitSnapshot(entry.filePath)
+      if (snapshot && (!latestLocalSnapshot || snapshot.timestamp > latestLocalSnapshot.timestamp))
+        latestLocalSnapshot = snapshot
+    }
+    rateLimits = toRateLimits(latestLocalSnapshot)
+    rateLimitSource = hasRateLimits(rateLimits) ? 'local' : 'none'
+  }
+  if (hasRateLimits(rateLimits)) lastObservedRateLimits = rateLimits
 
   const issues: string[] = []
   if (rateLimitSource !== 'official' && officialIssue) {
@@ -163,9 +176,7 @@ async function fetchOfficialRateLimits(
         return { rateLimits: pickLowerUsage(first, second) }
       }
     }
-    return first !== undefined
-      ? { rateLimits: first }
-      : { issue: '官方接口未返回额度信息' }
+    return first !== undefined ? { rateLimits: first } : { issue: '官方接口未返回额度信息' }
   } catch (error) {
     return { issue: error instanceof Error ? error.message : String(error) }
   }
@@ -336,7 +347,10 @@ export function parseOfficialDispatchResetAts(
   ] as const) {
     const windowState = getRecord(rateLimit[keys[0]] ?? rateLimit[keys[1]])
     const resetAt = getNonNegativeNumber(
-      windowState?.reset_at ?? windowState?.resetAt ?? windowState?.resets_at ?? windowState?.resetsAt
+      windowState?.reset_at ??
+        windowState?.resetAt ??
+        windowState?.resets_at ??
+        windowState?.resetsAt
     )
     if (resetAt !== undefined) {
       result[windowId] = resetAt
@@ -501,7 +515,8 @@ function createOfficialRateLimitWindow(
   id: string,
   record: Record<string, unknown> | undefined,
   observedAt: Date
-): RateLimitWindowSnapshot | undefined {  if (!record) {
+): RateLimitWindowSnapshot | undefined {
+  if (!record) {
     return undefined
   }
 
@@ -621,45 +636,55 @@ async function collectJsonlFilesInto(
 
     try {
       const stat = await fs.stat(fullPath)
-      entries.push({ filePath: fullPath, mtimeMs: stat.mtimeMs })
+      entries.push({ filePath: fullPath, mtimeMs: stat.mtimeMs, size: stat.size })
     } catch {
       continue
     }
   }
 }
 
-async function readLatestRateLimitSnapshot(
+const localQuotaFileCache = new Map<string, { cursor: JsonlCursor; snapshot?: RateLimitSnapshot }>()
+
+export async function readLatestRateLimitSnapshot(
   filePath: string
 ): Promise<RateLimitSnapshot | undefined> {
   try {
-    const content = await fs.readFile(filePath, 'utf8')
-    const lines = content.split(/\r?\n/).filter((line) => line.trim().length > 0)
     let latestSnapshot: RateLimitSnapshot | undefined
+    const previous = localQuotaFileCache.get(filePath)
+    const cursor = await readJsonlIncrementally(
+      filePath,
+      previous?.cursor,
+      (append) => {
+        if (append) latestSnapshot = previous?.snapshot
+      },
+      (rawLine) => {
+        if (!rawLine.includes('"token_count"')) return
+        const parsed = parseJsonObject(rawLine)
+        if (!parsed) {
+          return
+        }
 
-    for (const rawLine of lines) {
-      const parsed = parseJsonObject(rawLine)
-      if (!parsed) {
-        continue
-      }
+        const entryType = getString(parsed.type)
+        const payload = getRecord(parsed.payload)
+        if (entryType !== 'event_msg' || !payload || getString(payload.type) !== 'token_count') {
+          return
+        }
 
-      const entryType = getString(parsed.type)
-      const payload = getRecord(parsed.payload)
-      if (entryType !== 'event_msg' || !payload || getString(payload.type) !== 'token_count') {
-        continue
-      }
+        const rateLimits = getRecord(payload.rate_limits)
+        const timestamp = parseTimestamp(parsed)
+        if (!rateLimits || !timestamp) {
+          return
+        }
 
-      const rateLimits = getRecord(payload.rate_limits)
-      const timestamp = parseTimestamp(parsed)
-      if (!rateLimits || !timestamp) {
-        continue
-      }
-
-      latestSnapshot = {
-        timestamp,
-        primary: normalizeRateLimit(getRecord(rateLimits.primary)),
-        secondary: normalizeRateLimit(getRecord(rateLimits.secondary))
-      }
-    }
+        latestSnapshot = {
+          timestamp,
+          primary: normalizeRateLimit(getRecord(rateLimits.primary)),
+          secondary: normalizeRateLimit(getRecord(rateLimits.secondary))
+        }
+      },
+      skipNonUsageLine
+    )
+    localQuotaFileCache.set(filePath, { cursor, snapshot: latestSnapshot })
 
     return latestSnapshot
   } catch {
@@ -723,8 +748,7 @@ function createRateLimitWindow(
         : undefined
   const hasExpired = resetsAt !== undefined && resetsAt.getTime() <= now
   // 官方快照的 used_percent 用于判断重置后是否已有其他请求;本地旧日志仍需归零避免展示陈旧额度。
-  const usedPercent =
-    hasExpired && !preserveExpiredUsage ? 0 : clampPercent(raw.usedPercent)
+  const usedPercent = hasExpired && !preserveExpiredUsage ? 0 : clampPercent(raw.usedPercent)
   const remainingPercent = usedPercent === undefined ? undefined : clampPercent(100 - usedPercent)
   const resetsInSeconds =
     resetsAt === undefined ? undefined : Math.max(0, Math.floor((resetsAt.getTime() - now) / 1000))
@@ -741,10 +765,7 @@ function createRateLimitWindow(
   }
 }
 
-function resolveWindowLabel(
-  id: string,
-  windowMinutes: number | undefined
-): string {
+function resolveWindowLabel(id: string, windowMinutes: number | undefined): string {
   if (windowMinutes === undefined) {
     return id
   }

@@ -1,3 +1,4 @@
+import { readJsonlIncrementally, skipNonUsageLine, type JsonlCursor } from './jsonl-cursor.ts'
 // Agent 工具 provider 抽象:统一"本地扫描 → 事件级 token 用量"的接口。
 // v1 只做本地扫描出用量/花费,不涉及 billing/官方额度/重置卡/雷达。
 // 注:codex 与 claude 的扫描逻辑已迁到 usage.ts 做增量(incrementalScanCodex/incrementalScanClaude),
@@ -7,7 +8,13 @@ import os from 'node:os'
 import path from 'node:path'
 import type { DatabaseSync } from 'node:sqlite'
 import type { AgentId } from '../../shared/capsule'
-import { collectJsonlFiles, getNonNegativeNumber, getRecord, getString, parseJsonObject } from './quota.ts'
+import {
+  collectJsonlFiles,
+  getNonNegativeNumber,
+  getRecord,
+  getString,
+  parseJsonObject
+} from './quota.ts'
 import type { JsonlFileEntry } from './quota.ts'
 
 /** 单次用量增量的五分量 token 计数 */
@@ -69,33 +76,58 @@ async function listClaudeFilesAt(now: number): Promise<JsonlFileEntry[]> {
 // 解析单个 Claude 会话文件为事件级明细;同一 message.id 在文件里会重复出现
 // (Anthropic 先写 message_start 快照再写最终块,部分会话还会被重放多份),按 id 只取代表行,
 // 避免同一请求被重复计入(实测未去重时总量虚高 ~2.3x)。
+export interface ClaudeFileState {
+  cursor: JsonlCursor
+  best: Map<string, ClaudeParsedLine>
+  anonymous: UsageEvent[]
+  events: UsageEvent[]
+}
+
 export async function parseClaudeFile(filePath: string): Promise<UsageEvent[]> {
-  let content: string
+  return (await parseClaudeFileIncrementally(filePath, undefined, true))?.events ?? []
+}
+
+export async function parseClaudeFileIncrementally(
+  filePath: string,
+  previous?: ClaudeFileState,
+  includeFinalLine = true
+): Promise<ClaudeFileState | undefined> {
+  let best = new Map<string, ClaudeParsedLine>()
+  let anonymous: UsageEvent[] = []
   try {
-    content = await fs.readFile(filePath, 'utf8')
+    const cursor = await readJsonlIncrementally(
+      filePath,
+      previous?.cursor,
+      (append) => {
+        if (append && previous) {
+          best = new Map(previous.best)
+          anonymous = [...previous.anonymous]
+        }
+      },
+      (rawLine) => {
+        if (!rawLine.includes('"usage"')) return
+        const line = parseClaudeLine(rawLine)
+        if (!line) return
+        if (!line.messageId) {
+          anonymous.push(line.event)
+          return
+        }
+        const prev = best.get(line.messageId)
+        if (!prev || isBetterRepresentative(prev, line)) best.set(line.messageId, line)
+      },
+      skipNonUsageLine,
+      includeFinalLine
+    )
+    if (previous && cursor === previous.cursor) return previous
+    return {
+      cursor,
+      best,
+      anonymous,
+      events: [...best.values()].map((line) => line.event).concat(anonymous)
+    }
   } catch {
-    return []
+    return undefined
   }
-  const best = new Map<string, ClaudeParsedLine>()
-  const events: UsageEvent[] = []
-  for (const rawLine of content.split(/\r?\n/)) {
-    if (rawLine.trim().length === 0) {
-      continue
-    }
-    const line = parseClaudeLine(rawLine)
-    if (!line) {
-      continue
-    }
-    if (!line.messageId) {
-      events.push(line.event)
-      continue
-    }
-    const prev = best.get(line.messageId)
-    if (!prev || isBetterRepresentative(prev, line)) {
-      best.set(line.messageId, line)
-    }
-  }
-  return [...best.values()].map((line) => line.event).concat(events)
 }
 
 interface ClaudeParsedLine {
@@ -232,8 +264,8 @@ export function parseOpenCodeMessage(dataRaw: string | undefined): UsageEvent | 
   const outputTokens = getNonNegativeNumber(tokens.output) ?? 0
   const reasoning = getNonNegativeNumber(tokens.reasoning) ?? 0
   const cache = getRecord(tokens.cache)
-  const cacheRead = cache ? getNonNegativeNumber(cache.read) ?? 0 : 0
-  const cacheWrite = cache ? getNonNegativeNumber(cache.write) ?? 0 : 0
+  const cacheRead = cache ? (getNonNegativeNumber(cache.read) ?? 0) : 0
+  const cacheWrite = cache ? (getNonNegativeNumber(cache.write) ?? 0) : 0
   const cachedInput = cacheRead + cacheWrite
   const input = freshInput + cachedInput
   const output = outputTokens + reasoning
@@ -244,7 +276,14 @@ export function parseOpenCodeMessage(dataRaw: string | undefined): UsageEvent | 
   const event: UsageEvent = {
     ts,
     model: getString(data.modelID),
-    tokens: { input, cachedInput, output, reasoning, total: input + output, cacheCreation: cacheWrite }
+    tokens: {
+      input,
+      cachedInput,
+      output,
+      reasoning,
+      total: input + output,
+      cacheCreation: cacheWrite
+    }
   }
   const cost = getNonNegativeNumber(data.cost) ?? 0
   if (cost > 0) {

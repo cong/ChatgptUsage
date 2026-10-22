@@ -1,4 +1,6 @@
+import { readJsonlIncrementally, skipNonUsageLine, type JsonlCursor } from './jsonl-cursor.ts'
 import { promises as fs } from 'node:fs'
+import { readUsageStorage, writeUsageStorage } from './usage-storage.ts'
 import {
   collectJsonlFiles,
   getNonNegativeNumber,
@@ -18,13 +20,17 @@ import type {
   TokenUsageOverview,
   UsageWindow
 } from '../../shared/capsule'
-import { AGENT_PROVIDERS, listClaudeFiles, parseClaudeFile, type UsageEvent } from './agents.ts'
+import {
+  AGENT_PROVIDERS,
+  listClaudeFiles,
+  parseClaudeFileIncrementally,
+  type ClaudeFileState,
+  type UsageEvent
+} from './agents.ts'
 import { computeCost, normalizeModel } from './rate.ts'
 
 // 展示窗口最大天数;buildSeries 按此取日期序列,事件层过滤由日期序列完成(对齐 cc-switch 查询层过滤)
 const CACHE_TTL_MS = 30_000
-// 增量缓存兜底:距上次全量重扫超过该时长强制全量对账,消除 mtime 不可靠导致的累计偏差
-const FULL_RESCAN_INTERVAL_MS = 24 * 60 * 60 * 1000
 
 /** 单次增量(相邻 token_count 事件 total 之差);cacheCreation 仅 claude/opencode 提供,codex 恒为 0 */
 interface TokenDelta {
@@ -80,8 +86,14 @@ type DayMap = Map<string, Accum>
 
 /** 单个文件的上次解析产物:codex 存 ParsedFile(父子去重要用),claude 存独立事件 */
 type FileState =
-  | { kind: 'codex'; mtimeMs: number; parsed: ParsedFile }
-  | { kind: 'claude'; mtimeMs: number; events: UsageEvent[] }
+  | {
+      kind: 'codex'
+      mtimeMs: number
+      parsed: ParsedFile
+      cursor: JsonlCursor
+      continuation: CodexContinuation
+    }
+  | { kind: 'claude'; mtimeMs: number; state: ClaudeFileState }
 
 interface CacheEntry {
   agentId: AgentId
@@ -90,8 +102,6 @@ interface CacheEntry {
   events: UsageEvent[]
   /** 文件级增量状态:path → 该文件上次解析产物 */
   files: Map<string, FileState>
-  /** 最近一次全量重扫时间戳;距上次超过 FULL_RESCAN_INTERVAL_MS 强制全量对账 */
-  fullScannedAtMs: number
 }
 
 /** 一次扫描的产物:按天聚合 + 事件级明细 */
@@ -110,9 +120,7 @@ const cacheByAgent = new Map<AgentId, CacheEntry>()
 // 并发去重:同一 agent 的并发扫描复用同一 Promise,避免 3 窗口并行拉取时重复扫描
 const inflightByAgent = new Map<AgentId, Promise<ScannedData>>()
 // 最近一次算出的每窗口每工具 token 总数,供 LAN 广播(peer 排行榜分段)同步读取
-let lastAgentTotals:
-  | Partial<Record<UsageWindow, Partial<Record<AgentId, number>>>>
-  | undefined
+let lastAgentTotals: Partial<Record<UsageWindow, Partial<Record<AgentId, number>>>> | undefined
 
 /**
  * 获取 1/7/30 天 token 用量与估算花费。
@@ -275,7 +283,7 @@ export async function warmAllAgentTokenTotals(): Promise<
 // 避免每 30s 快照刷新后 UI 拉取时重复读+解析全部文件;切换 agentId 会因指纹前缀不同而自动失效
 async function loadScanned(agentId: AgentId): Promise<ScannedData> {
   const now = Date.now()
-  const cached = cacheByAgent.get(agentId)
+  let cached = cacheByAgent.get(agentId)
   if (cached && now - cached.fetchedAtMs < CACHE_TTL_MS) {
     return cached
   }
@@ -285,18 +293,36 @@ async function loadScanned(agentId: AgentId): Promise<ScannedData> {
   }
   const promise = (async () => {
     try {
-      // 距上次全量重扫超时则强制全量,否则用上次文件状态做增量 diff
-      const forceFull = cached !== undefined && now - cached.fullScannedAtMs >= FULL_RESCAN_INTERVAL_MS
-      const prevFiles = forceFull ? undefined : cached?.files
-      const scanned = await scanIncrementally(agentId, prevFiles)
-      cacheByAgent.set(agentId, {
+      if (!cached) {
+        const restored = await readUsageStorage<{ roots: string; entry: CacheEntry }>(agentId)
+        if (
+          restored?.roots === resolveSessionPaths().join('|') &&
+          restored.entry.files instanceof Map
+        ) {
+          cached = restored.entry
+        }
+      }
+      const scanned = await scanIncrementally(agentId, cached?.files)
+      const entry: CacheEntry = {
         agentId,
         fetchedAtMs: now,
-        fullScannedAtMs: forceFull ? now : (cached?.fullScannedAtMs ?? now),
         days: scanned.days,
         events: scanned.events,
         files: scanned.files
-      })
+      }
+      cacheByAgent.set(agentId, entry)
+      // 保存汇总、用量事件与读取位置，不保存聊天或工具输出。
+      const changed =
+        !cached ||
+        scanned.files.size !== cached.files.size ||
+        [...scanned.files].some(([key, value]) => {
+          const previous = cached?.files.get(key)
+          return value.kind === 'codex'
+            ? previous?.kind !== 'codex' || value.parsed !== previous.parsed
+            : previous?.kind !== 'claude' || value.state !== previous.state
+        })
+      if (changed)
+        await writeUsageStorage(agentId, { roots: resolveSessionPaths().join('|'), entry })
       return { days: scanned.days, events: scanned.events }
     } finally {
       inflightByAgent.delete(agentId)
@@ -339,14 +365,13 @@ async function incrementalScanClaude(
   const events: UsageEvent[] = []
   for (const entry of entries) {
     const prev = prevFiles?.get(entry.filePath)
-    if (prev?.kind === 'claude' && prev.mtimeMs === entry.mtimeMs) {
-      files.set(entry.filePath, prev)
-      events.push(...prev.events)
-      continue
-    }
-    const fileEvents = await parseClaudeFile(entry.filePath)
-    files.set(entry.filePath, { kind: 'claude', mtimeMs: entry.mtimeMs, events: fileEvents })
-    events.push(...fileEvents)
+    const state = await parseClaudeFileIncrementally(
+      entry.filePath,
+      prev?.kind === 'claude' ? prev.state : undefined
+    )
+    if (!state) continue
+    files.set(entry.filePath, { kind: 'claude', mtimeMs: state.cursor.mtimeMs, state })
+    for (const event of state.events) events.push(event)
   }
   // Claude 会跨文件重复同一 message.id(续会话/会话副本),按 id 全局只留 usage 更大的代表
   const deduped = dedupClaudeEvents(events)
@@ -384,17 +409,22 @@ async function incrementalScanCodex(
   const parsed: Array<{ threadId: string | undefined; file: ParsedFile }> = []
   for (const entry of entries) {
     const prev = prevFiles?.get(entry.filePath)
-    if (prev?.kind === 'codex' && prev.mtimeMs === entry.mtimeMs) {
-      files.set(entry.filePath, prev)
-      parsed.push({ threadId: threadIdFromFilename(entry.filePath), file: prev.parsed })
-      continue
-    }
     const threadId = threadIdFromFilename(entry.filePath)
-    const file = await parseSessionFile(entry.filePath, threadId)
-    if (!file || file.events.length === 0) {
-      continue
-    }
-    files.set(entry.filePath, { kind: 'codex', mtimeMs: entry.mtimeMs, parsed: file })
+    const result = await parseSessionFile(
+      entry.filePath,
+      threadId,
+      prev?.kind === 'codex' ? prev : undefined
+    )
+    if (!result) continue
+    const { file, cursor, continuation } = result
+    // 无用量的新文件也保存位置，后续从新增内容继续。
+    files.set(entry.filePath, {
+      kind: 'codex',
+      mtimeMs: cursor.mtimeMs,
+      parsed: file,
+      cursor,
+      continuation
+    })
     parsed.push({ threadId, file })
   }
   const events = dedupParsedFiles(parsed)
@@ -604,7 +634,7 @@ async function collectRecentFiles(): Promise<JsonlFileEntry[]> {
     if (!(await pathExists(root))) {
       continue
     }
-    entries.push(...(await collectJsonlFiles(root, Number.MAX_SAFE_INTEGER)))
+    for (const entry of await collectJsonlFiles(root, Number.MAX_SAFE_INTEGER)) entries.push(entry)
   }
   return entries.sort((left, right) => left.filePath.localeCompare(right.filePath))
 }
@@ -627,20 +657,19 @@ function isValidUuid(value: string): boolean {
   return UUID_RE.test(value)
 }
 
-// 解析单个 session 文件:session_meta 记父子关系,turn_context 记模型,token_count 记差值
-// 流式逐行读取(对齐 cc-switch BufReader::lines L784-783),避免大文件 readFile 触发
-// V8 字符串长度上限(~512MB)导致 RangeError → 文件被丢弃 → 子会话误判孤儿。
-async function parseSessionFile(
-  filePath: string,
-  threadId: string | undefined
-): Promise<ParsedFile | undefined> {
-  let handle: fs.FileHandle
-  try {
-    handle = await fs.open(filePath, 'r')
-  } catch {
-    return undefined
-  }
+interface CodexContinuation {
+  model?: string
+  highWater?: TokenDelta
+  lastSignatureBySource: Map<string, TokenSignature>
+  previousTokenSignature?: TokenSignature
+  rootMetaSeen: boolean
+}
 
+export async function parseSessionFile(
+  filePath: string,
+  threadId: string | undefined,
+  previous?: Extract<FileState, { kind: 'codex' }>
+): Promise<{ file: ParsedFile; cursor: JsonlCursor; continuation: CodexContinuation } | undefined> {
   let parent: string | undefined
   let deferred = false
   let rootTs: number | undefined
@@ -657,136 +686,170 @@ async function parseSessionFile(
   // cc-switch:只在第一个本文件 session_meta 做 parent/deferred 判定,重放的父 meta 跳过(L813)
   let rootMetaSeen = false
 
-  let leftover = ''
-  for await (const chunk of handle.createReadStream({ encoding: 'utf8' })) {
-    leftover += chunk
-    const lines = leftover.split(/\r?\n/)
-    // 最后一段可能是不完整行,留给下一个 chunk 拼接
-    leftover = lines.pop() ?? ''
-    for (const rawLine of lines) {
-      if (rawLine.trim().length === 0) {
-        continue
-      }
-      const parsed = parseJsonObject(rawLine)
-      if (!parsed) {
-        continue
-      }
-      const payload = getRecord(parsed.payload)
-      if (!payload) {
-        continue
-      }
-
-      const topType = getString(parsed.type)
-      if (topType === 'session_meta') {
-        // cc-switch:只在首个 session_meta 判定(L813 if !root_meta_seen)
-        if (rootMetaSeen) {
-          continue
+  try {
+    const cursor = await readJsonlIncrementally(
+      filePath,
+      previous?.cursor,
+      (append) => {
+        if (!append || !previous) return
+        const file = previous.parsed
+        parent = file.parent
+        deferred = file.deferred
+        rootTs = file.rootTs
+        model = previous.continuation.model
+        for (const event of file.events) events.push(event)
+        hasTokenWithoutTimestamp = file.hasTokenWithoutTimestamp
+        maxTimestamp = file.maxTimestamp
+        highWater = previous.continuation.highWater
+        previousTokenSignature = previous.continuation.previousTokenSignature
+        rootMetaSeen = previous.continuation.rootMetaSeen
+        for (const [key, value] of previous.continuation.lastSignatureBySource)
+          lastSignatureBySource.set(key, value)
+      },
+      (rawLine) => {
+        // 不解析对话正文和工具输出，减少短期对象分配。
+        if (
+          !rawLine.includes('"token_count"') &&
+          !rawLine.includes('"session_meta"') &&
+          !rawLine.includes('"turn_context"')
+        )
+          return
+        const parsed = parseJsonObject(rawLine)
+        if (!parsed) {
+          return
         }
-        rootMetaSeen = true
-        const metaId = getString(payload.id)
-        // cc-switch:文件名 threadId 与 root meta id 不一致 → deferred(L825-830)
-        if (threadId && metaId && metaId !== threadId) {
-          deferred = true
-        } else {
-          const forked = getString(payload.forked_from_id)
-          const sourceMeta = getRecord(getRecord(payload.source)?.subagent)
-          const threadSpawn = sourceMeta ? getRecord(sourceMeta.thread_spawn) : undefined
-          const spawned = getString(threadSpawn?.parent_thread_id)
-          // cc-switch explicit_parent_from_meta(L408-414):
-          // 两者都有且不等 → Deferred;否则取存在的那个作 parent
-          if (forked && spawned && forked !== spawned) {
+        const payload = getRecord(parsed.payload)
+        if (!payload) {
+          return
+        }
+
+        const topType = getString(parsed.type)
+        if (topType === 'session_meta') {
+          // cc-switch:只在首个 session_meta 判定(L813 if !root_meta_seen)
+          if (rootMetaSeen) {
+            return
+          }
+          rootMetaSeen = true
+          const metaId = getString(payload.id)
+          // cc-switch:文件名 threadId 与 root meta id 不一致 → deferred(L825-830)
+          if (threadId && metaId && metaId !== threadId) {
             deferred = true
           } else {
-            const resolved = forked ?? spawned
-            if (resolved) {
-              // cc-switch:parent 非法 UUID → Deferred(L833-841)
-              if (!isValidUuid(resolved)) {
-                deferred = true
-              }
-              // cc-switch:parent 与自身 threadId 相同 → Deferred(L843-848)
-              else if (threadId && resolved === threadId) {
-                deferred = true
-              } else {
-                parent = resolved
+            const forked = getString(payload.forked_from_id)
+            const sourceMeta = getRecord(getRecord(payload.source)?.subagent)
+            const threadSpawn = sourceMeta ? getRecord(sourceMeta.thread_spawn) : undefined
+            const spawned = getString(threadSpawn?.parent_thread_id)
+            // cc-switch explicit_parent_from_meta(L408-414):
+            // 两者都有且不等 → Deferred;否则取存在的那个作 parent
+            if (forked && spawned && forked !== spawned) {
+              deferred = true
+            } else {
+              const resolved = forked ?? spawned
+              if (resolved) {
+                // cc-switch:parent 非法 UUID → Deferred(L833-841)
+                if (!isValidUuid(resolved)) {
+                  deferred = true
+                }
+                // cc-switch:parent 与自身 threadId 相同 → Deferred(L843-848)
+                else if (threadId && resolved === threadId) {
+                  deferred = true
+                } else {
+                  parent = resolved
+                }
               }
             }
           }
+          const metaTs = parseTimestamp(payload)
+          if (metaTs) {
+            rootTs = metaTs.getTime()
+          }
+          return
         }
-        const metaTs = parseTimestamp(payload)
-        if (metaTs) {
-          rootTs = metaTs.getTime()
+        if (topType === 'turn_context') {
+          const modelName = getString(payload.model)
+          if (modelName) {
+            model = modelName
+          }
+          return
         }
-        continue
-      }
-      if (topType === 'turn_context') {
-        const modelName = getString(payload.model)
-        if (modelName) {
-          model = modelName
+        if (topType !== 'event_msg' || getString(payload.type) !== 'token_count') {
+          return
         }
-        continue
-      }
-      if (topType !== 'event_msg' || getString(payload.type) !== 'token_count') {
-        continue
-      }
 
-      const info = getRecord(payload.info)
-      const totalUsage = info ? getRecord(info.total_token_usage) : undefined
-      const lastUsage = info ? getRecord(info.last_token_usage) : undefined
-      // cc-switch:total 和 last 任一存在即继续(L891-893);不能要求 total 必须存在,
-      // 否则"只有 last 没 total"的事件被跳过,父文件可能解析成 0 events → 子会话误判孤儿。
-      if (!totalUsage && !lastUsage) {
-        continue
-      }
-      const hasTotalSnapshot = totalUsage !== undefined
-      const timestamp = parseTimestamp(parsed)
-      // cc-switch:token_count 缺有效 timestamp → 标记父时间线不可用(L1025-1027),
-      // 该文件作父时子会话 skipAll(L155-159)
-      if (!timestamp) {
-        hasTokenWithoutTimestamp = true
-        continue
-      }
-      // 跟踪最大 timestamp;作父时若 < 子 rootTs → 子 skipAll(cc-switch L161-168)
-      const tsMs = timestamp.getTime()
-      if (maxTimestamp === undefined || tsMs > maxTimestamp) {
-        maxTimestamp = tsMs
-      }
-
-      const signature = buildSignature(totalUsage, lastUsage)
-      // cc-switch:判重只在有 total 快照时做(L894-897);只有 last 的事件不判重
-      // (last 每次请求都变,不会是重复快照)。
-      const snapshotSource = getString(getRecord(payload.rate_limits)?.limit_id)
-      const duplicate =
-        hasTotalSnapshot &&
-        (sigEq(signature, previousTokenSignature) ||
-          (snapshotSource !== undefined && sigEq(signature, lastSignatureBySource.get(snapshotSource))))
-      if (hasTotalSnapshot && snapshotSource !== undefined) {
-        lastSignatureBySource.set(snapshotSource, signature)
-      }
-      if (hasTotalSnapshot) {
-        previousTokenSignature = signature
-      }
-
-      // cc-switch delta(L903-922):last 优先 → total 高水位差兜底 → 都没有 continue(已挡)
-      const current = totalUsage ? toDelta(totalUsage) : toDelta(lastUsage!)
-      const delta = duplicate ? ZERO_DELTA : buildCodexDelta(current, lastUsage, highWater)
-      // 高水位只在 total 存在时更新(cc-switch L923-929);只有 last 时不推进
-      if (totalUsage) {
-        if (!highWater || current.total > highWater.total) {
-          highWater = current
+        const info = getRecord(payload.info)
+        const totalUsage = info ? getRecord(info.total_token_usage) : undefined
+        const lastUsage = info ? getRecord(info.last_token_usage) : undefined
+        // cc-switch:total 和 last 任一存在即继续(L891-893);不能要求 total 必须存在,
+        // 否则"只有 last 没 total"的事件被跳过,父文件可能解析成 0 events → 子会话误判孤儿。
+        if (!totalUsage && !lastUsage) {
+          return
         }
-      }
+        const hasTotalSnapshot = totalUsage !== undefined
+        const timestamp = parseTimestamp(parsed)
+        // cc-switch:token_count 缺有效 timestamp → 标记父时间线不可用(L1025-1027),
+        // 该文件作父时子会话 skipAll(L155-159)
+        if (!timestamp) {
+          hasTokenWithoutTimestamp = true
+          return
+        }
+        // 跟踪最大 timestamp;作父时若 < 子 rootTs → 子 skipAll(cc-switch L161-168)
+        const tsMs = timestamp.getTime()
+        if (maxTimestamp === undefined || tsMs > maxTimestamp) {
+          maxTimestamp = tsMs
+        }
 
-      events.push({
-        ts: tsMs,
-        sig: signature,
-        delta,
-        model
-      })
+        const signature = buildSignature(totalUsage, lastUsage)
+        // cc-switch:判重只在有 total 快照时做(L894-897);只有 last 的事件不判重
+        // (last 每次请求都变,不会是重复快照)。
+        const snapshotSource = getString(getRecord(payload.rate_limits)?.limit_id)
+        const duplicate =
+          hasTotalSnapshot &&
+          (sigEq(signature, previousTokenSignature) ||
+            (snapshotSource !== undefined &&
+              sigEq(signature, lastSignatureBySource.get(snapshotSource))))
+        if (hasTotalSnapshot && snapshotSource !== undefined) {
+          lastSignatureBySource.set(snapshotSource, signature)
+        }
+        if (hasTotalSnapshot) {
+          previousTokenSignature = signature
+        }
+
+        // cc-switch delta(L903-922):last 优先 → total 高水位差兜底 → 都没有 return(已挡)
+        const current = totalUsage ? toDelta(totalUsage) : toDelta(lastUsage!)
+        const delta = duplicate ? ZERO_DELTA : buildCodexDelta(current, lastUsage, highWater)
+        // 高水位只在 total 存在时更新(cc-switch L923-929);只有 last 时不推进
+        if (totalUsage) {
+          if (!highWater || current.total > highWater.total) {
+            highWater = current
+          }
+        }
+
+        events.push({
+          ts: tsMs,
+          sig: signature,
+          delta,
+          model
+        })
+      },
+      skipNonUsageLine
+    )
+    if (previous && cursor === previous.cursor) {
+      return { file: previous.parsed, cursor, continuation: previous.continuation }
     }
+    return {
+      file: { parent, deferred, rootTs, events, hasTokenWithoutTimestamp, maxTimestamp },
+      cursor,
+      continuation: {
+        model,
+        highWater,
+        lastSignatureBySource,
+        previousTokenSignature,
+        rootMetaSeen
+      }
+    }
+  } catch {
+    return undefined
   }
-  await handle.close()
-
-  return { parent, deferred, rootTs, events, hasTokenWithoutTimestamp, maxTimestamp }
 }
 
 const ZERO_DELTA: TokenDelta = { input: 0, cachedInput: 0, output: 0, reasoning: 0, total: 0 }
