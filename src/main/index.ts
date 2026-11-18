@@ -162,6 +162,7 @@ let refreshPromise: Promise<void> | undefined
 let watchedCodexAuthPath: string | undefined
 let isQuitting = false
 let userHidCapsule = false
+let capsuleRendererReady = false
 let currentPanelView: PanelView = 'details'
 let latestUpdateProgress: UpdateProgress | undefined
 // 胶囊版本角标跳转设置页时的一次性定位标志:由 bootstrap 或 command 消费后清除
@@ -209,6 +210,7 @@ if (!hasSingleInstanceLock) {
 }
 
 function createCapsuleWindow(): BrowserWindow {
+  capsuleRendererReady = false
   const bounds = resolveCapsuleBounds(persistedState.window)
 
   const window = new BrowserWindow({
@@ -233,10 +235,7 @@ function createCapsuleWindow(): BrowserWindow {
     }
   })
 
-  // 不在 ready-to-show 直接 show:胶囊需等首次有数据后再显示,
-  // 避免启动时以最大尺寸空壳先露一帧、数据回来再缩小的"由大变小"闪烁。
-  // 显示时机改由渲染层 notifyCapsuleReady(数据就绪)驱动,见 CHANNELS.capsuleReady handler。
-
+  // 等界面完成首帧后再显示；联网刷新和历史统计均在后台进行。
   window.on('move', () => {
     const bounds = window.getBounds()
     persistedState = {
@@ -691,18 +690,12 @@ function registerIpcHandlers(): void {
     panelRevealPending = false
   })
 
-  // 胶囊显示时机:渲染层确认有数据(generatedAt 存在)并完成一帧绘制后通知,
-  // 此时窗口尺寸已是最终值,避免空壳先露再缩小的闪烁
-  ipcMain.handle(CHANNELS.capsuleReady, async () => {
-    if (!mainWindow || mainWindow.isDestroyed()) {
+  // 首帧就绪后即可显示，不能等待网络或 Token 历史扫描。
+  ipcMain.handle(CHANNELS.capsuleReady, async (event) => {
+    if (!mainWindow || mainWindow.isDestroyed() || event.sender.id !== mainWindow.webContents.id)
       return
-    }
-    if (!hasCapsuleData(currentSnapshot)) {
-      return
-    }
-    if (!mainWindow.isVisible()) {
-      showWindow()
-    }
+    capsuleRendererReady = true
+    if (!userHidCapsule && !mainWindow.isVisible()) showWindow()
   })
 
   // 普通点击沿用显隐切换;提醒跳转用 forceOpen 保证 panel 显示、聚焦并定位目标区域
@@ -1053,22 +1046,13 @@ function showWindow(): void {
   if (!mainWindow) {
     return
   }
-  // 自动 show 路径(second-instance/resume/display-metrics)在无数据时不提前显示,
-  // 避免空壳先露;数据就绪后由 capsuleReady 驱动显示
-  if (!hasCapsuleData(currentSnapshot)) {
-    return
-  }
+  // 保留首帧绘制守卫，显示不再依赖网络数据。
+  if (!capsuleRendererReady) return
 
   const bounds = resolveCapsuleRuntimeBounds()
   mainWindow.setBounds(bounds)
   mainWindow.show()
   mainWindow.focus()
-}
-
-// 数据就绪判定:首次刷新完成(无论成功/失败/无凭据)后 snapshot 带 generatedAt,
-// 启动初始空快照(createEmptySnapshot)无此字段
-function hasCapsuleData(snapshot: UsageSnapshot): boolean {
-  return snapshot.generatedAt !== undefined
 }
 
 function openSettingsFromTray(): void {

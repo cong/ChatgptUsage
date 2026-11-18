@@ -1,6 +1,6 @@
 {
   "name": "chatgpt-usage",
-  "version": "1.0.3",
+  "version": "1.0.4",
   "description": "ChatgptUsage - ChatGPT用量显示",
   "main": "./out/main/index.js",
   "author": "cong",
